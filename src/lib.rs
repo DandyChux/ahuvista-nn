@@ -1,4 +1,13 @@
-pub mod neuron;
+pub mod balancing;
+pub mod data;
+pub mod fusion;
+pub mod image;
 pub mod layer;
+pub mod loss;
+pub mod module;
 pub mod network;
+pub mod neuron;
+pub mod tabular;
+pub mod temporal;
+pub mod text;
 pub mod utils;

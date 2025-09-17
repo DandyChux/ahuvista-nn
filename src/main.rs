@@ -192,7 +192,6 @@ fn main() -> std::io::Result<()> {
     );
 
     // Add synthetic samples to training data if needed
-    // (Skipping implementation here for clarity)
 
     // Step 7: Train the model
     println!("Training model with population-weighted samples...");
@@ -642,33 +641,37 @@ fn create_data_loader(
     // Create data containers
     let tabular_container = TabularData {
         data: tabular_data,
-        feature_names: Vec::new(), // Not needed for the loader
+        feature_names: Vec::new(),
         numeric_stats: HashMap::new(),
         categorical_mappings: HashMap::new(),
         categorical_features: Vec::new(),
+        current_idx: 0,
     };
 
     let temporal_container = TemporalData {
         sequences: temporal_data,
         feature_names: Vec::new(),
         feature_stats: HashMap::new(),
-        max_seq_length: 0, // Will be calculated in the loader if needed
+        max_seq_length: 0,
+        current_idx: 0,
     };
 
     let text_container = TextData {
-        documents: Vec::new(), // Original documents not needed
+        documents: Vec::new(),
         token_sequences: text_data,
-        vocab: HashMap::new(), // Not needed for the loader
+        vocab: HashMap::new(),
         reverse_vocab: HashMap::new(),
         max_seq_length: 0,
+        current_idx: 0,
     };
 
     let image_container = ImageData {
         images: image_data,
-        image_size: (0, 0), // Will be inferred from the images
-        channels: 0,        // Will be inferred from the images
+        image_size: (224, 224), // Standard image size
+        channels: 3,            // RGB images
         channel_means: Vec::new(),
         channel_stds: Vec::new(),
+        current_idx: 0,
     };
 
     MultiModalDataLoader::new(
@@ -746,75 +749,26 @@ fn split_data_with_weights(
 
 /// Load tabular data from a CSV file
 fn load_tabular_data<P: AsRef<Path>>(path: P) -> io::Result<TabularData> {
-    // For demonstration, we'll create dummy data if the file doesn't exist
-    if !Path::new(path.as_ref()).exists() {
-        println!("Warning: Tabular data file not found. Creating dummy data.");
+    // Define which columns should be treated as categorical
+    let categorical_features = vec![
+        "ethnicity".to_string(),
+        "education_level".to_string(),
+        "insurance_type".to_string(),
+        "delivery_type".to_string(),
+        "prenatal_care_adequacy".to_string(),
+        "location_type".to_string(), // urban/rural
+    ];
 
-        // Create dummy data with 100 samples, 10 features each
-        let mut data = Vec::with_capacity(100);
-        for _ in 0..100 {
-            let mut features = Vec::with_capacity(10);
-            for _ in 0..10 {
-                features.push(rand::random::<f32>() * 2.0 - 1.0); // Random values between -1 and 1
-            }
-            data.push(features);
-        }
-
-        let feature_names = (0..10).map(|i| format!("Feature{}", i)).collect();
-
-        return Ok(TabularData {
-            data,
-            feature_names,
-            numeric_stats: HashMap::new(),
-            categorical_mappings: HashMap::new(),
-            categorical_features: Vec::new(),
-        });
-    }
-
-    // In a real implementation, you would read the actual file
-    TabularData::from_csv(path, true, &[])
+    TabularData::from_csv(path, true, &categorical_features)
 }
 
 /// Load temporal data from a CSV file
 fn load_temporal_data<P: AsRef<Path>>(path: P) -> io::Result<TemporalData> {
-    // For demonstration, we'll create dummy data if the file doesn't exist
-    if !Path::new(path.as_ref()).exists() {
-        println!("Warning: Temporal data file not found. Creating dummy data.");
-
-        // Create dummy data with 100 samples, variable sequence length, 5 features per timestep
-        let mut sequences = Vec::with_capacity(100);
-        let mut max_seq_length = 0;
-
-        for _ in 0..100 {
-            let seq_length = rand::random::<usize>() % 10 + 5; // Random length between 5 and 14
-            max_seq_length = max_seq_length.max(seq_length);
-
-            let mut sequence = Vec::with_capacity(seq_length);
-            for _ in 0..seq_length {
-                let mut features = Vec::with_capacity(5);
-                for _ in 0..5 {
-                    features.push(rand::random::<f32>() * 2.0 - 1.0); // Random values between -1 and 1
-                }
-                sequence.push(features);
-            }
-
-            sequences.push(sequence);
-        }
-
-        let feature_names = (0..5).map(|i| format!("TimeFeature{}", i)).collect();
-
-        return Ok(TemporalData {
-            sequences,
-            feature_names,
-            feature_stats: HashMap::new(),
-            max_seq_length,
-        });
-    }
-
-    // In a real implementation, you would read the actual file
+    // Load from a single CSV file where each patient has multiple rows
+    // Expects columns: PatientID, Timestamp, and various vital signs/lab values
     TemporalData::from_single_csv(
         path,
-        true,
+        true, // has header
         "PatientID".to_string(),
         Some("Timestamp".to_string()),
     )
@@ -822,173 +776,135 @@ fn load_temporal_data<P: AsRef<Path>>(path: P) -> io::Result<TemporalData> {
 
 /// Load text data from a CSV file
 fn load_text_data<P: AsRef<Path>>(path: P) -> io::Result<TextData> {
-    // For demonstration, we'll create dummy data if the file doesn't exist
-    if !Path::new(path.as_ref()).exists() {
-        println!("Warning: Text data file not found. Creating dummy data.");
-
-        // Create dummy vocabulary
-        let mut vocab = HashMap::new();
-        vocab.insert("<PAD>".to_string(), 0);
-        vocab.insert("<UNK>".to_string(), 1);
-
-        for i in 2..1002 {
-            // 1000 "words" in vocabulary
-            vocab.insert(format!("word{}", i - 2), i);
-        }
-
-        // Create dummy documents and token sequences
-        let mut documents = Vec::with_capacity(100);
-        let mut token_sequences = Vec::with_capacity(100);
-        let mut max_seq_length = 0;
-
-        for i in 0..100 {
-            let doc = format!("This is a dummy document for patient {}.", i);
-            documents.push(doc);
-
-            let seq_length = rand::random::<usize>() % 20 + 10; // Random length between 10 and 29
-            max_seq_length = max_seq_length.max(seq_length);
-
-            let mut tokens = Vec::with_capacity(seq_length);
-            for _ in 0..seq_length {
-                tokens.push(rand::random::<usize>() % 1000 + 2); // Random word indices
-            }
-
-            token_sequences.push(tokens);
-        }
-
-        // Create reverse vocabulary
-        let mut reverse_vocab = HashMap::new();
-        for (word, idx) in &vocab {
-            reverse_vocab.insert(*idx, word.clone());
-        }
-
-        return Ok(TextData {
-            documents,
-            token_sequences,
-            vocab,
-            reverse_vocab,
-            max_seq_length,
-        });
-    }
-
-    // In a real implementation, you would read the actual file
     let file = File::open(path)?;
     let reader = BufReader::new(file);
     let mut documents = Vec::new();
 
-    for line in reader.lines() {
+    // Skip header and read documents
+    for (i, line) in reader.lines().enumerate() {
+        if i == 0 {
+            continue;
+        } // Skip header
+
         let line = line?;
         let parts: Vec<&str> = line.split(',').collect();
 
-        if parts.len() >= 2 {
-            documents.push(parts[1].to_string()); // Assume second column is the text
+        if parts.len() < 2 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Line {} has insufficient columns", i + 1),
+            ));
         }
+
+        // Assume format: PatientID,NoteText
+        documents.push(parts[1..].join(",").trim_matches('"').to_string());
     }
 
+    // Create text data with a reasonable vocabulary size
     TextData::from_documents(documents, 10000)
 }
 
 /// Load image data from a directory
 fn load_image_data<P: AsRef<Path>>(dir_path: P) -> io::Result<ImageData> {
-    // For demonstration, we'll create dummy data if the directory doesn't exist
-    if !Path::new(dir_path.as_ref()).exists() {
-        println!("Warning: Image directory not found. Creating dummy data.");
-
-        // Create dummy images (100 samples, 3x32x32)
-        let mut images = Vec::with_capacity(100);
-
-        for _ in 0..100 {
-            let mut image = Array3::zeros((3, 32, 32));
-
-            // Fill with random values
-            for c in 0..3 {
-                for h in 0..32 {
-                    for w in 0..32 {
-                        image[[c, h, w]] = rand::random::<f32>() * 2.0 - 1.0; // Random values between -1 and 1
-                    }
-                }
-            }
-
-            images.push(image);
-        }
-
-        return Ok(ImageData {
-            images,
-            image_size: (32, 32),
-            channels: 3,
-            channel_means: vec![0.0, 0.0, 0.0],
-            channel_stds: vec![1.0, 1.0, 1.0],
-        });
-    }
-
-    // In a real implementation, you would read actual image files
-    let paths: Vec<String> = std::fs::read_dir(dir_path)?
+    // Collect all image file paths
+    let paths: Vec<std::path::PathBuf> = std::fs::read_dir(dir_path)?
         .filter_map(|entry| {
             let entry = entry.ok()?;
             let path = entry.path();
-            if path.is_file()
-                && path
-                    .extension()
-                    .map_or(false, |ext| ext == "jpg" || ext == "jpeg" || ext == "png")
-            {
-                Some(path.to_string_lossy().to_string())
+
+            // Check if it's an image file
+            if path.is_file() {
+                let ext = path.extension()?.to_str()?.to_lowercase();
+                if matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "bmp") {
+                    Some(path)
+                } else {
+                    None
+                }
             } else {
                 None
             }
         })
         .collect();
 
-    ImageData::from_files(&paths, (32, 32), false)
+    if paths.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "No image files found in directory",
+        ));
+    }
+
+    // Load images with standard size for medical imaging
+    // Using 224x224 for compatibility with standard models
+    ImageData::from_files(&paths, (224, 224), false) // false = keep RGB
 }
 
 /// Load target values and mortality causes from a CSV file
 fn load_targets_and_causes<P: AsRef<Path>>(path: P) -> io::Result<(Vec<f32>, Vec<usize>)> {
-    // For demonstration, we'll create dummy data if the file doesn't exist
-    if !Path::new(path.as_ref()).exists() {
-        println!("Warning: Target outcomes file not found. Creating dummy data.");
-
-        // Create 100 random binary targets and causes
-        let mut targets = Vec::with_capacity(100);
-        let mut causes = Vec::with_capacity(100);
-
-        for _ in 0..100 {
-            let is_mortality = rand::random::<f32>() > 0.7;
-            targets.push(if is_mortality { 1.0 } else { 0.0 });
-
-            // If mortality, assign a cause (0-4)
-            if is_mortality {
-                causes.push(rand::random::<usize>() % 5);
-            } else {
-                causes.push(4); // Default to "other" for non-mortality
-            }
-        }
-
-        return Ok((targets, causes));
-    }
-
-    // In a real implementation, you would read the actual file
     let file = File::open(path)?;
     let reader = BufReader::new(file);
     let mut targets = Vec::new();
     let mut causes = Vec::new();
 
-    for line in reader.lines().skip(1) {
-        // Skip header
+    // Skip header
+    let mut lines = reader.lines();
+    if let Some(header) = lines.next() {
+        let _ = header?; // Consume header
+    }
+
+    // Read each line
+    for (line_num, line) in lines.enumerate() {
         let line = line?;
         let parts: Vec<&str> = line.split(',').collect();
 
-        if parts.len() >= 3 {
-            let target = parts[1].parse::<f32>().unwrap_or(0.0);
-            targets.push(target);
-
-            let cause = if target > 0.5 {
-                parts[2].parse::<usize>().unwrap_or(4) // Parse cause
-            } else {
-                4 // Default to "other" for non-mortality
-            };
-
-            causes.push(cause);
+        if parts.len() < 3 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Line {} has insufficient columns", line_num + 2),
+            ));
         }
+
+        // Expected format: PatientID,Mortality(0/1),CauseCode
+        let mortality = parts[1].trim().parse::<f32>().map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Invalid mortality value on line {}: {}", line_num + 2, e),
+            )
+        })?;
+
+        // Validate binary target
+        if mortality != 0.0 && mortality != 1.0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Mortality must be 0 or 1, found {} on line {}",
+                    mortality,
+                    line_num + 2
+                ),
+            ));
+        }
+
+        targets.push(mortality);
+
+        // Parse cause code (0-4, where 4 is "other/none")
+        let cause = if mortality > 0.5 {
+            parts[2].trim().parse::<usize>().map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Invalid cause code on line {}: {}", line_num + 2, e),
+                )
+            })?
+        } else {
+            4 // No cause for survivors
+        };
+
+        causes.push(cause);
+    }
+
+    if targets.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "No data found in outcomes file",
+        ));
     }
 
     Ok((targets, causes))

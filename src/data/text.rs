@@ -25,6 +25,9 @@ pub struct TextData {
 
     /// Maximum sequence length
     pub max_seq_length: usize,
+
+    /// Current index for batch iteration
+    current_idx: usize,
 }
 
 impl TextData {
@@ -36,6 +39,7 @@ impl TextData {
             vocab: HashMap::new(),
             reverse_vocab: HashMap::new(),
             max_seq_length: 0,
+            current_idx: 0,
         }
     }
 
@@ -75,6 +79,7 @@ impl TextData {
             vocab: HashMap::new(),
             reverse_vocab: HashMap::new(),
             max_seq_length: 0,
+            current_idx: 0,
         };
 
         // Build vocabulary
@@ -194,25 +199,19 @@ impl TextData {
 
 impl DataLoader<Vec<Vec<usize>>> for TextData {
     fn next_batch(&mut self, batch_size: usize) -> Option<Vec<Vec<usize>>> {
-        static mut CURRENT_IDX: usize = 0;
-
-        unsafe {
-            if CURRENT_IDX >= self.token_sequences.len() {
-                return None;
-            }
-
-            let end_idx = (CURRENT_IDX + batch_size).min(self.token_sequences.len());
-            let batch = self.token_sequences[CURRENT_IDX..end_idx].to_vec();
-
-            CURRENT_IDX = end_idx;
-            Some(batch)
+        if self.current_idx >= self.token_sequences.len() {
+            return None;
         }
+
+        let end_idx = (self.current_idx + batch_size).min(self.token_sequences.len());
+        let batch = self.token_sequences[self.current_idx..end_idx].to_vec();
+
+        self.current_idx = end_idx;
+        Some(batch)
     }
 
     fn reset(&mut self) {
-        unsafe {
-            CURRENT_IDX = 0;
-        }
+        self.current_idx = 0;
     }
 
     fn len(&self) -> usize {

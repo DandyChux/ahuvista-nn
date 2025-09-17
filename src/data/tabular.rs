@@ -25,6 +25,9 @@ pub struct TabularData {
 
     /// Which features are categorical (vs numeric)
     pub categorical_features: Vec<String>,
+
+    /// Current index for batch iteration
+    current_idx: usize,
 }
 
 impl TabularData {
@@ -36,6 +39,7 @@ impl TabularData {
             numeric_stats: HashMap::new(),
             categorical_mappings: HashMap::new(),
             categorical_features: Vec::new(),
+            current_idx: 0,
         }
     }
 
@@ -53,7 +57,7 @@ impl TabularData {
         has_header: bool,
         categorical_features: &[String],
     ) -> io::Result<Self> {
-        let file = File::open(path)?;
+        let file = File::open(&path)?;
         let reader = BufReader::new(file);
         let mut lines = reader.lines();
 
@@ -86,7 +90,7 @@ impl TabularData {
         // If we read the first line to count features, put it back
         if !has_header {
             // Reset the reader to start from the beginning
-            let file = File::open(path)?;
+            let file = File::open(&path)?;
             let reader = BufReader::new(file);
             lines = reader.lines();
         }
@@ -142,6 +146,7 @@ impl TabularData {
             numeric_stats: HashMap::new(),
             categorical_mappings: HashMap::new(),
             categorical_features: all_categorical_features.clone(),
+            current_idx: 0,
         };
 
         // Build categorical mappings and compute numeric stats
@@ -278,25 +283,19 @@ impl TabularData {
 
 impl DataLoader<Vec<Vec<f32>>> for TabularData {
     fn next_batch(&mut self, batch_size: usize) -> Option<Vec<Vec<f32>>> {
-        static mut CURRENT_IDX: usize = 0;
-
-        unsafe {
-            if CURRENT_IDX >= self.data.len() {
-                return None;
-            }
-
-            let end_idx = (CURRENT_IDX + batch_size).min(self.data.len());
-            let batch = self.data[CURRENT_IDX..end_idx].to_vec();
-
-            CURRENT_IDX = end_idx;
-            Some(batch)
+        if self.current_idx >= self.data.len() {
+            return None;
         }
+
+        let end_idx = (self.current_idx + batch_size).min(self.data.len());
+        let batch = self.data[self.current_idx..end_idx].to_vec();
+
+        self.current_idx = end_idx;
+        Some(batch)
     }
 
     fn reset(&mut self) {
-        unsafe {
-            CURRENT_IDX = 0;
-        }
+        self.current_idx = 0;
     }
 
     fn len(&self) -> usize {

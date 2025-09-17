@@ -22,6 +22,9 @@ pub struct TemporalData {
 
     /// Maximum sequence length across all samples
     pub max_seq_length: usize,
+
+    /// Current index for batch iteration
+    current_idx: usize,
 }
 
 impl TemporalData {
@@ -32,6 +35,7 @@ impl TemporalData {
             feature_names: Vec::new(),
             feature_stats: HashMap::new(),
             max_seq_length: 0,
+            current_idx: 0,
         }
     }
 
@@ -194,6 +198,7 @@ impl TemporalData {
             feature_names,
             feature_stats,
             max_seq_length: max_length,
+            current_idx: 0,
         };
 
         // Normalize sequences
@@ -218,7 +223,7 @@ impl TemporalData {
         patient_id_column: String,
         time_column: Option<String>,
     ) -> io::Result<Self> {
-        let file = File::open(path)?;
+        let file = File::open(&path)?;
         let reader = BufReader::new(file);
         let mut lines = reader.lines();
 
@@ -283,13 +288,13 @@ impl TemporalData {
         }
 
         // If we read the first line to count features, reset the reader
-        let mut lines = if !has_header {
-            let file = File::open(path)?;
+        let lines = if !has_header {
+            let file = File::open(&path)?;
             let reader = BufReader::new(file);
             reader.lines()
         } else {
             // Skip header
-            let file = File::open(path)?;
+            let file = File::open(&path)?;
             let reader = BufReader::new(file);
             let mut lines = reader.lines();
             lines.next();
@@ -400,6 +405,7 @@ impl TemporalData {
             feature_names,
             feature_stats,
             max_seq_length: max_length,
+            current_idx: 0,
         };
 
         // Normalize sequences
@@ -471,25 +477,19 @@ impl TemporalData {
 
 impl DataLoader<Vec<Vec<Vec<f32>>>> for TemporalData {
     fn next_batch(&mut self, batch_size: usize) -> Option<Vec<Vec<Vec<f32>>>> {
-        static mut CURRENT_IDX: usize = 0;
-
-        unsafe {
-            if CURRENT_IDX >= self.sequences.len() {
-                return None;
-            }
-
-            let end_idx = (CURRENT_IDX + batch_size).min(self.sequences.len());
-            let batch = self.sequences[CURRENT_IDX..end_idx].to_vec();
-
-            CURRENT_IDX = end_idx;
-            Some(batch)
+        if self.current_idx >= self.sequences.len() {
+            return None;
         }
+
+        let end_idx = (self.current_idx + batch_size).min(self.sequences.len());
+        let batch = self.sequences[self.current_idx..end_idx].to_vec();
+
+        self.current_idx = end_idx;
+        Some(batch)
     }
 
     fn reset(&mut self) {
-        unsafe {
-            CURRENT_IDX = 0;
-        }
+        self.current_idx = 0;
     }
 
     fn len(&self) -> usize {

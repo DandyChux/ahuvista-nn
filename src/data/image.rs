@@ -26,6 +26,9 @@ pub struct ImageData {
 
     /// Standard deviation of pixel values for each channel
     pub channel_stds: Vec<f32>,
+
+    /// Current index for batch iteration
+    current_idx: usize,
 }
 
 impl ImageData {
@@ -37,6 +40,7 @@ impl ImageData {
             channels: 0,
             channel_means: Vec::new(),
             channel_stds: Vec::new(),
+            current_idx: 0,
         }
     }
 
@@ -166,6 +170,7 @@ impl ImageData {
             channels,
             channel_means,
             channel_stds,
+            current_idx: 0,
         })
     }
 
@@ -238,25 +243,19 @@ impl ImageData {
 
 impl DataLoader<Vec<Array3<f32>>> for ImageData {
     fn next_batch(&mut self, batch_size: usize) -> Option<Vec<Array3<f32>>> {
-        static mut CURRENT_IDX: usize = 0;
-
-        unsafe {
-            if CURRENT_IDX >= self.images.len() {
-                return None;
-            }
-
-            let end_idx = (CURRENT_IDX + batch_size).min(self.images.len());
-            let batch = self.images[CURRENT_IDX..end_idx].to_vec();
-
-            CURRENT_IDX = end_idx;
-            Some(batch)
+        if self.current_idx >= self.images.len() {
+            return None;
         }
+
+        let end_idx = (self.current_idx + batch_size).min(self.images.len());
+        let batch = self.images[self.current_idx..end_idx].to_vec();
+
+        self.current_idx = end_idx;
+        Some(batch)
     }
 
     fn reset(&mut self) {
-        unsafe {
-            CURRENT_IDX = 0;
-        }
+        self.current_idx = 0;
     }
 
     fn len(&self) -> usize {

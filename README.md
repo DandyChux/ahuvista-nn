@@ -316,7 +316,7 @@ Best for: Custom training pipelines, research, integration with other systems
 ```rust
 use ahuvista_nn::{
     config::{ModalityConfig, Settings},
-    core::fusion_modular::{ModularLateFusionNet, MultiModalInput},
+    core::fusion_modular::{LateFusionNet, MultiModalInput},
     training::training_loop::TrainingConfig,
 };
 use std::collections::HashMap;
@@ -331,7 +331,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // 2. Build model
-    let mut model = ModularLateFusionNet::new(
+    let mut model = LateFusionNet::new(
         modality_config,
         Some((10, vec![64, 32], 16)),  // tabular: (input_size, hidden_layers, output_size)
         Some((5, 32, 16)),              // temporal: (input_size, hidden_size, output_size)
@@ -371,7 +371,7 @@ fn create_model_from_available_data(
     has_temporal: bool,
     has_text: bool,
     has_image: bool,
-) -> Result<ModularLateFusionNet, Box<dyn std::error::Error>> {
+) -> Result<LateFusionNet, Box<dyn std::error::Error>> {
     // Build configuration from available data
     let config = ModalityConfig {
         use_tabular: has_tabular,
@@ -384,7 +384,7 @@ fn create_model_from_available_data(
     config.validate()?;
 
     // Build model with appropriate parameters
-    let model = ModularLateFusionNet::new(
+    let model = LateFusionNet::new(
         config,
         if has_tabular { Some((10, vec![64, 32], 16)) } else { None },
         if has_temporal { Some((5, 32, 16)) } else { None },
@@ -744,21 +744,21 @@ images/
     // Tabular network architecture
     "tabular_hidden_sizes": [64, 32],   // Hidden layer sizes (2 layers: 64→32 neurons)
     "tabular_output_size": 16,           // Size of tabular feature vector
-    
+
     // Temporal network architecture
     "temporal_hidden_size": 32,          // RNN hidden state size
     "temporal_output_size": 16,          // Size of temporal feature vector
-    
+
     // Text network architecture
     "text_embedding_dim": 50,            // Word embedding dimension
     "text_hidden_size": 32,              // Text RNN hidden state size
     "text_max_vocab": 5000,              // Maximum vocabulary size
-    
+
     // Image network architecture
     "image_channels": 3,                 // Number of image channels (3=RGB, 1=grayscale)
     "image_height": 224,                 // Target image height in pixels
     "image_width": 224,                  // Target image width in pixels
-    
+
     // Classifier network
     "classifier_hidden_sizes": [64, 32]  // Final classifier hidden layers
   }
@@ -819,8 +819,8 @@ images/
 
 ```rust
 use ahuvista_nn::training::balancing::{
-    compute_sample_weights, 
-    BayesianCalibrator, 
+    compute_sample_weights,
+    BayesianCalibrator,
     CauseWeights
 };
 use std::collections::HashMap;
@@ -844,8 +844,8 @@ stratum_multipliers.insert("rural_old".to_string(), 1.8);
 
 // Compute sample weights
 let sample_weights = compute_sample_weights(
-    &targets, 
-    Some(&patient_strata), 
+    &targets,
+    Some(&patient_strata),
     Some(&stratum_multipliers)
 );
 ```
@@ -874,7 +874,7 @@ println!("Modality config: {:?}", config);
 model.save("models/my_model.bin")?;
 
 // Load model for inference
-let mut loaded_model = ModularLateFusionNet::new(
+let mut loaded_model = LateFusionNet::new(
     config,
     tabular_params,
     temporal_params,
@@ -927,7 +927,7 @@ let risk_level = if risk_score > 0.8 {
 | Tabular + Image | ~150 MB | 15-25 min | < 50 ms |
 | All modalities | ~200 MB | 30-45 min | < 100 ms |
 
-\* Training time for 10,000 samples, 50 epochs on CPU (Intel i7)  
+\* Training time for 10,000 samples, 50 epochs on CPU (Intel i7)
 \** Single prediction on CPU
 
 ### Optimization Tips
@@ -1072,13 +1072,13 @@ cargo run --release --bin ahuvista-predict -- \
 # Test different modality combinations
 for combo in "tabular" "temporal" "tabular,temporal" "tabular,text" "all"; do
   echo "Testing: $combo"
-  
+
   if [ "$combo" = "all" ]; then
     modalities="tabular,temporal,text,image"
   else
     modalities="$combo"
   fi
-  
+
   cargo run --release --bin ahuvista-train -- \
     --modalities $modalities \
     --epochs 30 \
@@ -1300,6 +1300,6 @@ Combine with commas: `--modalities tabular,temporal,text`
 
 ---
 
-**Version**: 2.0.0  
-**Last Updated**: 2024  
+**Version**: 2.0.0
+**Last Updated**: 2025
 **Status**: Active Development

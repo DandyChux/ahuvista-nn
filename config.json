@@ -1,0 +1,44 @@
+{
+	"modalities": {
+		"use_tabular": true,
+		"use_temporal": false,
+		"use_text": false,
+		"use_image": false
+	},
+	"data_paths": {
+		"data_dir": "datasets",
+		"patient_id_column": "PatientID",
+		"tabular_files": [
+			"tabular_data.csv"
+		],
+		"temporal_files": [
+			"temporal_data.csv"
+		],
+		"text_files": null,
+		"image_files": null
+	},
+	"training": {
+		"epochs": 50,
+		"batch_size": 32,
+		"learning_rate": 0.001
+	},
+	"model": {
+		"tabular_hidden_sizes": [
+			64,
+			32
+		],
+		"tabular_output_size": 16,
+		"temporal_hidden_size": 32,
+		"temporal_output_size": 16,
+		"text_embedding_dim": 50,
+		"text_hidden_size": 32,
+		"text_max_vocab": 5000,
+		"image_channels": 3,
+		"image_height": 224,
+		"image_width": 224,
+		"classifier_hidden_sizes": [
+			64,
+			32
+		]
+	}
+}

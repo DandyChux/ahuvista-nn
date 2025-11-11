@@ -27,7 +27,7 @@ pub struct TextData {
     pub max_seq_length: usize,
 
     /// Current index for batch iteration
-    current_idx: usize,
+    pub current_idx: usize,
 }
 
 impl TextData {

@@ -1,4 +1,4 @@
-use crate::module::Module;
+use crate::core::Module;
 use rand::Rng;
 use std::collections::HashMap;
 
@@ -6,7 +6,7 @@ use std::collections::HashMap;
 ///
 /// Maps word indices to dense vector representations.
 #[derive(Debug)]
-pub struct Embedding {
+pub struct EmbeddingLayer {
     /// Vocabulary size
     vocab_size: usize,
 
@@ -23,7 +23,7 @@ pub struct Embedding {
     last_indices: Vec<usize>,
 }
 
-impl Embedding {
+impl EmbeddingLayer {
     /// Create a new embedding layer.
     ///
     /// # Arguments
@@ -35,7 +35,7 @@ impl Embedding {
         // Initialize with small random values
         let scale = (1.0 / embedding_dim as f32).sqrt();
 
-        Embedding {
+        EmbeddingLayer {
             vocab_size,
             embedding_dim,
             weights: (0..vocab_size * embedding_dim)
@@ -44,6 +44,27 @@ impl Embedding {
             grad_weights: vec![0.0; vocab_size * embedding_dim],
             last_indices: Vec::new(),
         }
+    }
+
+    /// Get all parameters from the embedding layer.
+    pub fn get_parameters(&self) -> Vec<f32> {
+        self.weights.clone()
+    }
+
+    /// Set all parameters in the embedding layer.
+    /// Returns the number of parameters consumed.
+    pub fn set_parameters(&mut self, params: &[f32]) -> Result<usize, Box<dyn std::error::Error>> {
+        let weights_len = self.weights.len();
+        if params.len() < weights_len {
+            return Err(format!(
+                "Not enough parameters. Expected {}, got {}",
+                weights_len,
+                params.len()
+            )
+            .into());
+        }
+        self.weights.copy_from_slice(&params[..weights_len]);
+        Ok(weights_len)
     }
 
     /// Get an embedding vector for a given word index.
@@ -71,10 +92,10 @@ pub struct TextNet {
     pub vocab: HashMap<String, usize>,
 
     /// Embedding layer
-    embedding: Embedding,
+    embedding: EmbeddingLayer,
 
     /// RNN for sequence processing
-    rnn_cell: crate::temporal::SimpleRnnCell,
+    rnn_cell: crate::models::SimpleRnnCell,
 
     /// Last hidden state from forward pass
     last_hidden: Vec<f32>,
@@ -95,11 +116,27 @@ impl TextNet {
 
         TextNet {
             vocab,
-            embedding: Embedding::new(vocab_size, embedding_dim),
-            rnn_cell: crate::temporal::SimpleRnnCell::new(embedding_dim, hidden_size),
+            embedding: EmbeddingLayer::new(vocab_size, embedding_dim),
+            rnn_cell: crate::models::SimpleRnnCell::new(embedding_dim, hidden_size),
             last_hidden: vec![0.0; hidden_size],
             cached_embedded_sequence: Vec::new(),
         }
+    }
+
+    /// Get all parameters from the network.
+    pub fn get_parameters(&self) -> Vec<f32> {
+        let mut params = self.embedding.get_parameters();
+        params.extend(self.rnn_cell.get_parameters());
+        params
+    }
+
+    /// Set all parameters in the network.
+    /// Returns the number of parameters consumed.
+    pub fn set_parameters(&mut self, params: &[f32]) -> Result<usize, Box<dyn std::error::Error>> {
+        let mut offset = 0;
+        offset += self.embedding.set_parameters(&params[offset..])?;
+        offset += self.rnn_cell.set_parameters(&params[offset..])?;
+        Ok(offset)
     }
 
     /// Build a vocabulary from a list of texts.
@@ -210,7 +247,7 @@ impl Module<Vec<usize>, Vec<f32>> for TextNet {
             let h = &self.rnn_cell.cached_hiddens[t + 1];
 
             // Gradient through tanh
-            let dtanh = crate::temporal::SimpleRnnCell::tanh_derivative(h);
+            let dtanh = crate::models::SimpleRnnCell::tanh_derivative(h);
             let dh = dtanh
                 .iter()
                 .zip(&dh_next)
@@ -269,26 +306,48 @@ impl Module<Vec<usize>, Vec<f32>> for TextNet {
         self.embedding.last_indices.clone()
     }
 
-    fn update(&mut self, lr: f32) {
+    fn gradients(&self) -> Vec<f32> {
+        let mut grads = Vec::new();
+
+        // Collect embedding gradients
+        grads.extend_from_slice(&self.embedding.grad_weights);
+
+        // Collect RNN gradients
+        grads.extend_from_slice(&self.rnn_cell.grad_w_ih);
+        grads.extend_from_slice(&self.rnn_cell.grad_w_hh);
+        grads.extend_from_slice(&self.rnn_cell.grad_b_h);
+
+        grads
+    }
+
+    fn apply_gradients(&mut self, gradients: &[f32], lr: f32) {
+        let mut offset = 0;
+
         // Update embedding weights
-        for i in 0..self.embedding.weights.len() {
-            self.embedding.weights[i] -= lr * self.embedding.grad_weights[i];
+        let embedding_size = self.embedding.weights.len();
+        for i in 0..embedding_size {
+            self.embedding.weights[i] -= lr * gradients[offset + i];
         }
+        offset += embedding_size;
 
-        // Update RNN parameters
-        // Input weights
-        for i in 0..self.rnn_cell.w_ih.len() {
-            self.rnn_cell.w_ih[i] -= lr * self.rnn_cell.grad_w_ih[i];
+        // Update RNN input weights
+        let w_ih_size = self.rnn_cell.w_ih.len();
+        for i in 0..w_ih_size {
+            self.rnn_cell.w_ih[i] -= lr * gradients[offset + i];
         }
+        offset += w_ih_size;
 
-        // Hidden weights
-        for i in 0..self.rnn_cell.w_hh.len() {
-            self.rnn_cell.w_hh[i] -= lr * self.rnn_cell.grad_w_hh[i];
+        // Update RNN hidden weights
+        let w_hh_size = self.rnn_cell.w_hh.len();
+        for i in 0..w_hh_size {
+            self.rnn_cell.w_hh[i] -= lr * gradients[offset + i];
         }
+        offset += w_hh_size;
 
-        // Biases
-        for i in 0..self.rnn_cell.b_h.len() {
-            self.rnn_cell.b_h[i] -= lr * self.rnn_cell.grad_b_h[i];
+        // Update RNN biases
+        let b_h_size = self.rnn_cell.b_h.len();
+        for i in 0..b_h_size {
+            self.rnn_cell.b_h[i] -= lr * gradients[offset + i];
         }
     }
 

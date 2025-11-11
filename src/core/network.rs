@@ -1,5 +1,4 @@
-use crate::layer::Layer;
-use crate::module::Module;
+use crate::core::{Layer, Module};
 
 /// A multi-layer perceptron (MLP) neural network.
 ///
@@ -53,6 +52,25 @@ impl Network {
         network
     }
 
+    /// Get all parameters from all layers in the network.
+    pub fn get_parameters(&self) -> Vec<f32> {
+        self.layers
+            .iter()
+            .flat_map(|layer| layer.get_parameters())
+            .collect()
+    }
+
+    /// Set all parameters for all layers in the network.
+    /// Returns the number of parameters consumed.
+    pub fn set_parameters(&mut self, params: &[f32]) -> Result<usize, Box<dyn std::error::Error>> {
+        let mut offset = 0;
+        for layer in &mut self.layers {
+            let consumed = layer.set_parameters(&params[offset..])?;
+            offset += consumed;
+        }
+        Ok(offset)
+    }
+
     /// Get the input size of the network
     pub fn input_size(&self) -> usize {
         if self.layers.is_empty() {
@@ -79,7 +97,7 @@ impl Module<Vec<f32>, Vec<f32>> for Network {
 
         let mut current_inputs = inputs;
 
-        for (i, layer) in self.layers.iter_mut().enumerate() {
+        for layer in self.layers.iter_mut() {
             let outputs = layer.forward(current_inputs);
             self.layer_outputs.push(outputs.clone());
             current_inputs = outputs;
@@ -109,9 +127,20 @@ impl Module<Vec<f32>, Vec<f32>> for Network {
         current_grad
     }
 
-    fn update(&mut self, lr: f32) {
+    fn gradients(&self) -> Vec<f32> {
+        let mut all_gradients = Vec::new();
+        for layer in &self.layers {
+            all_gradients.extend(layer.gradients());
+        }
+        all_gradients
+    }
+
+    fn apply_gradients(&mut self, gradients: &[f32], learning_rate: f32) {
+        // for (layer, gradient) in self.layers.iter_mut().zip(gradients) {
+        //     layer.apply_gradients(gradient, learning_rate);
+        // }
         for layer in &mut self.layers {
-            layer.update(lr);
+            layer.apply_gradients(gradients, learning_rate);
         }
     }
 

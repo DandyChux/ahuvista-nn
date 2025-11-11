@@ -1,13 +1,22 @@
-pub mod balancing;
+//! Ahuvista-NN: Multi-modal Neural Network for Maternal Mortality Prediction
+//!
+//! This library provides components for building, training, and evaluating
+//! multi-modal neural networks specialized for healthcare risk prediction.
+
+// Core neural network components
+pub mod core;
+
+// Data handling and loaders for different modalities
 pub mod data;
-pub mod fusion;
-pub mod image;
-pub mod layer;
-pub mod loss;
-pub mod module;
-pub mod network;
-pub mod neuron;
-pub mod tabular;
-pub mod temporal;
-pub mod text;
+
+// Model architectures for specific modalities
+pub mod models;
+
+// Training, loss functions, and optimization
+pub mod training;
+
+// Utility functions
 pub mod utils;
+
+// Config
+pub mod config;

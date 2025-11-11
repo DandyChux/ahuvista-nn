@@ -1,12 +1,12 @@
-use crate::module::Module;
-use ndarray::{Array, Array3, Array4, Axis};
+use crate::core::{Layer, Module};
+use ndarray::{s, Array, Array1, Array3, Array4, Axis};
 use rand::Rng;
 
 /// 2D convolution layer.
 ///
 /// Applies convolution operation over a 3D input (channels × height × width).
 #[derive(Debug)]
-pub struct Conv2d {
+pub struct Conv2DLayer {
     /// Number of input channels
     in_channels: usize,
 
@@ -26,18 +26,18 @@ pub struct Conv2d {
     weights: Array4<f32>,
 
     /// Biases: [out_channels]
-    biases: Array<f32, Axis>,
+    biases: Array1<f32>,
 
     /// Gradients for weights and biases
     grad_weights: Array4<f32>,
-    grad_biases: Array<f32, Axis>,
+    grad_biases: Array1<f32>,
 
     /// Cache for backpropagation
     last_input: Option<Array3<f32>>,
     last_output: Option<Array3<f32>>,
 }
 
-impl Conv2d {
+impl Conv2DLayer {
     /// Create a new 2D convolution layer.
     ///
     /// # Arguments
@@ -59,11 +59,11 @@ impl Conv2d {
         let std_dev = (2.0 / (in_channels * kernel_size * kernel_size) as f32).sqrt();
 
         let weights_shape = [out_channels, in_channels, kernel_size, kernel_size];
-        let weights = Array::from_shape_fn(weights_shape, |_| rng.gen_range(-std_dev..std_dev));
+        let weights = Array::from_shape_fn(weights_shape, |_| rng.random_range(-std_dev..std_dev));
 
-        let biases = Array::zeros(out_channels);
+        let biases = Array1::zeros(out_channels);
 
-        Conv2d {
+        Conv2DLayer {
             in_channels,
             out_channels,
             kernel_size,
@@ -72,10 +72,39 @@ impl Conv2d {
             weights,
             biases,
             grad_weights: Array::zeros(weights_shape),
-            grad_biases: Array::zeros(out_channels),
+            grad_biases: Array1::zeros(out_channels),
             last_input: None,
             last_output: None,
         }
+    }
+
+    /// Get all parameters from the layer.
+    pub fn get_parameters(&self) -> Vec<f32> {
+        let mut params = self.weights.iter().copied().collect::<Vec<f32>>();
+        params.extend(self.biases.iter().copied());
+        params
+    }
+
+    /// Set all parameters in the layer.
+    /// Returns the number of parameters consumed.
+    pub fn set_parameters(&mut self, params: &[f32]) -> Result<usize, Box<dyn std::error::Error>> {
+        let weights_size = self.weights.len();
+        let biases_size = self.biases.len();
+        let expected_len = weights_size + biases_size;
+
+        if params.len() < expected_len {
+            return Err(format!(
+                "Not enough parameters. Expected {}, got {}",
+                expected_len,
+                params.len()
+            )
+            .into());
+        }
+
+        self.weights = Array::from_shape_vec(self.weights.dim(), params[..weights_size].to_vec())?;
+        self.biases = Array1::from_vec(params[weights_size..expected_len].to_vec());
+
+        Ok(expected_len)
     }
 
     /// Calculate output dimensions after convolution.
@@ -127,8 +156,8 @@ impl Conv2d {
     }
 
     /// Forward pass for a single window.
-    fn forward_window(&self, input_window: &Array3<f32>) -> Array<f32, Axis> {
-        let mut output = Array::zeros(self.out_channels);
+    fn forward_window(&self, input_window: &Array3<f32>) -> Array1<f32> {
+        let mut output = Array1::zeros(self.out_channels);
 
         for out_ch in 0..self.out_channels {
             let mut sum = 0.0;
@@ -148,7 +177,7 @@ impl Conv2d {
     }
 }
 
-impl Module<Array3<f32>, Array3<f32>> for Conv2d {
+impl Module<Array3<f32>, Array3<f32>> for Conv2DLayer {
     fn forward(&mut self, input: Array3<f32>) -> Array3<f32> {
         let (channels, height, width) = (input.shape()[0], input.shape()[1], input.shape()[2]);
 
@@ -271,12 +300,27 @@ impl Module<Array3<f32>, Array3<f32>> for Conv2d {
         grad_input
     }
 
-    fn update(&mut self, lr: f32) {
-        // Update weights
-        self.weights -= &(&self.grad_weights * lr);
+    fn gradients(&self) -> Vec<f32> {
+        let mut grads = Vec::new();
+        // Flatten weight gradients
+        grads.extend(self.grad_weights.iter().cloned());
+        // Add bias gradients
+        grads.extend(self.grad_biases.iter().cloned());
+        grads
+    }
 
-        // Update biases
-        self.biases -= &(&self.grad_biases * lr);
+    fn apply_gradients(&mut self, gradients: &[f32], learning_rate: f32) {
+        let weights_len = self.grad_weights.len();
+
+        // Apply weight gradients
+        for (i, grad) in gradients[..weights_len].iter().enumerate() {
+            self.weights.as_slice_mut().unwrap()[i] -= grad * learning_rate;
+        }
+
+        // Apply bias gradients
+        for (i, grad) in gradients[weights_len..].iter().enumerate() {
+            self.biases[i] -= grad * learning_rate;
+        }
     }
 
     fn zero_grad(&mut self) {
@@ -289,7 +333,7 @@ impl Module<Array3<f32>, Array3<f32>> for Conv2d {
 ///
 /// Reduces spatial dimensions by taking maximum value in each window.
 #[derive(Debug)]
-pub struct MaxPool2d {
+pub struct MaxPool2DLayer {
     /// Pool size (square)
     pool_size: usize,
 
@@ -301,14 +345,14 @@ pub struct MaxPool2d {
     max_indices: Option<Array3<(usize, usize)>>,
 }
 
-impl MaxPool2d {
+impl MaxPool2DLayer {
     /// Create a new max pooling layer.
     ///
     /// # Arguments
     /// * `pool_size` - Size of pooling window
     /// * `stride` - Stride (if None, use pool_size)
     pub fn new(pool_size: usize, stride: Option<usize>) -> Self {
-        MaxPool2d {
+        MaxPool2DLayer {
             pool_size,
             stride: stride.unwrap_or(pool_size),
             last_input: None,
@@ -331,7 +375,7 @@ impl MaxPool2d {
     }
 }
 
-impl Module<Array3<f32>, Array3<f32>> for MaxPool2d {
+impl Module<Array3<f32>, Array3<f32>> for MaxPool2DLayer {
     fn forward(&mut self, input: Array3<f32>) -> Array3<f32> {
         let (channels, height, width) = (input.shape()[0], input.shape()[1], input.shape()[2]);
 
@@ -413,7 +457,12 @@ impl Module<Array3<f32>, Array3<f32>> for MaxPool2d {
         grad_input
     }
 
-    fn update(&mut self, _lr: f32) {
+    fn gradients(&self) -> Vec<f32> {
+        // No learnable parameters
+        Vec::new()
+    }
+
+    fn apply_gradients(&mut self, _gradients: &[f32], _learning_rate: f32) {
         // No parameters to update
     }
 
@@ -429,16 +478,19 @@ impl Module<Array3<f32>, Array3<f32>> for MaxPool2d {
 #[derive(Debug)]
 pub struct ImageNet {
     /// First convolution layer
-    conv1: Conv2d,
+    conv1: Conv2DLayer,
 
     /// First pooling layer
-    pool1: MaxPool2d,
+    pool1: MaxPool2DLayer,
 
     /// Second convolution layer
-    conv2: Conv2d,
+    conv2: Conv2DLayer,
 
     /// Second pooling layer
-    pool2: MaxPool2d,
+    pool2: MaxPool2DLayer,
+
+    /// Flattened input layer
+    fc_layer: Layer,
 
     /// Input dimensions (channels, height, width)
     input_dims: (usize, usize, usize),
@@ -447,7 +499,7 @@ pub struct ImageNet {
     output_size: usize,
 
     /// Last flattened output for backpropagation
-    last_flattened: Option<Vec<f32>>,
+    last_flattened: Vec<f32>,
 }
 
 impl ImageNet {
@@ -460,17 +512,20 @@ impl ImageNet {
     /// * `feature_size` - Size of output feature vector
     pub fn new(input_channels: usize, input_height: usize, input_width: usize) -> Self {
         // Define a small, efficient CNN
-        let conv1 = Conv2d::new(input_channels, 8, 3, 1, 1);
-        let pool1 = MaxPool2d::new(2, None);
+        let conv1 = Conv2DLayer::new(input_channels, 8, 3, 1, 1);
+        let pool1 = MaxPool2DLayer::new(2, None);
 
-        let conv2 = Conv2d::new(8, 16, 3, 1, 1);
-        let pool2 = MaxPool2d::new(2, None);
+        let conv2 = Conv2DLayer::new(8, 16, 3, 1, 1);
+        let pool2 = MaxPool2DLayer::new(2, None);
 
         // Calculate output dimensions
         let (h1, w1) = conv1.output_dimensions(input_height, input_width);
         let (h2, w2) = pool1.output_dimensions(h1, w1);
         let (h3, w3) = conv2.output_dimensions(h2, w2);
         let (h4, w4) = pool2.output_dimensions(h3, w3);
+
+        let flattened_size = 32 * h4 * w4;
+        let output_size = 128;
 
         // Final output size after flattening
         let output_size = 16 * h4 * w4;
@@ -480,10 +535,29 @@ impl ImageNet {
             pool1,
             conv2,
             pool2,
+            fc_layer: Layer::new(output_size, flattened_size),
             input_dims: (input_channels, input_height, input_width),
             output_size,
-            last_flattened: None,
+            last_flattened: Vec::new(),
         }
+    }
+
+    /// Get all parameters from the network.
+    pub fn get_parameters(&self) -> Vec<f32> {
+        let mut params = self.conv1.get_parameters();
+        params.extend(self.conv2.get_parameters());
+        params.extend(self.fc_layer.get_parameters());
+        params
+    }
+
+    /// Set all parameters in the network.
+    /// Returns the number of parameters consumed.
+    pub fn set_parameters(&mut self, params: &[f32]) -> Result<usize, Box<dyn std::error::Error>> {
+        let mut offset = 0;
+        offset += self.conv1.set_parameters(&params[offset..])?;
+        offset += self.conv2.set_parameters(&params[offset..])?;
+        offset += self.fc_layer.set_parameters(&params[offset..])?;
+        Ok(offset)
     }
 
     /// Get the output size of this network
@@ -519,7 +593,7 @@ impl Module<Array3<f32>, Vec<f32>> for ImageNet {
 
         // Flatten to 1D vector
         let flattened: Vec<f32> = x.iter().cloned().collect();
-        self.last_flattened = Some(flattened.clone());
+        self.last_flattened = flattened.clone();
 
         flattened
     }
@@ -527,7 +601,7 @@ impl Module<Array3<f32>, Vec<f32>> for ImageNet {
     fn backward(&mut self, grad_output: Vec<f32>) -> Array3<f32> {
         // Reshape gradient back to 3D
         let (c, h, w) = {
-            let (_, h1, w1) = self
+            let (h1, w1) = self
                 .conv1
                 .output_dimensions(self.input_dims.1, self.input_dims.2);
             let (h2, w2) = self.pool1.output_dimensions(h1, w1);
@@ -558,10 +632,36 @@ impl Module<Array3<f32>, Vec<f32>> for ImageNet {
         grad_input
     }
 
-    fn update(&mut self, lr: f32) {
-        self.conv1.update(lr);
-        self.conv2.update(lr);
-        // Pooling layers have no parameters
+    fn gradients(&self) -> Vec<f32> {
+        let mut grads = Vec::new();
+        grads.extend(self.conv1.gradients());
+        grads.extend(self.pool1.gradients());
+        grads.extend(self.conv2.gradients());
+        grads.extend(self.pool2.gradients());
+        grads
+    }
+
+    fn apply_gradients(&mut self, gradients: &[f32], learning_rate: f32) {
+        let conv1_size = self.conv1.gradients().len();
+        let pool1_size = self.pool1.gradients().len();
+        let conv2_size = self.conv2.gradients().len();
+
+        let mut offset = 0;
+
+        self.conv1
+            .apply_gradients(&gradients[offset..offset + conv1_size], learning_rate);
+        offset += conv1_size;
+
+        self.pool1
+            .apply_gradients(&gradients[offset..offset + pool1_size], learning_rate);
+        offset += pool1_size;
+
+        self.conv2
+            .apply_gradients(&gradients[offset..offset + conv2_size], learning_rate);
+        offset += conv2_size;
+
+        self.pool2
+            .apply_gradients(&gradients[offset..], learning_rate);
     }
 
     fn zero_grad(&mut self) {

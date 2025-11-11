@@ -1,5 +1,4 @@
-use crate::module::Module;
-use crate::neuron::Neuron;
+use crate::core::{Module, Neuron};
 
 /// A layer of neurons in a neural network.
 ///
@@ -29,13 +28,32 @@ impl Layer {
     pub fn size(&self) -> usize {
         self.neurons.len()
     }
+
+    /// Get all parameters from all neurons in the layer.
+    pub fn get_parameters(&self) -> Vec<f32> {
+        self.neurons
+            .iter()
+            .flat_map(|neuron| neuron.get_parameters())
+            .collect()
+    }
+
+    /// Set all parameters for all neurons in the layer.
+    /// Returns the number of parameters consumed.
+    pub fn set_parameters(&mut self, params: &[f32]) -> Result<usize, Box<dyn std::error::Error>> {
+        let mut offset = 0;
+        for neuron in &mut self.neurons {
+            let consumed = neuron.set_parameters(&params[offset..])?;
+            offset += consumed;
+        }
+        Ok(offset)
+    }
 }
 
 impl Module<Vec<f32>, Vec<f32>> for Layer {
     fn forward(&mut self, inputs: Vec<f32>) -> Vec<f32> {
         self.neurons
             .iter_mut()
-            .map(|neuron| neuron.forward(&inputs))
+            .map(|neuron| neuron.forward(inputs.clone()))
             .collect()
     }
 
@@ -62,9 +80,17 @@ impl Module<Vec<f32>, Vec<f32>> for Layer {
         grad_inputs
     }
 
-    fn update(&mut self, lr: f32) {
-        for neuron in &mut self.neurons {
-            neuron.update(lr);
+    fn gradients(&self) -> Vec<f32> {
+        self.neurons
+            .iter()
+            .map(|neuron| neuron.gradients())
+            .collect::<Vec<Vec<f32>>>()
+            .concat()
+    }
+
+    fn apply_gradients(&mut self, gradients: &[f32], learning_rate: f32) {
+        for (neuron, &gradient) in self.neurons.iter_mut().zip(gradients) {
+            neuron.apply_gradients(&[gradient], learning_rate);
         }
     }
 

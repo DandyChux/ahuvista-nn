@@ -1,5 +1,4 @@
-use crate::module::Module;
-use crate::network::Network;
+use crate::core::{Module, Network};
 
 /// Neural network for processing tabular (structured) data.
 ///
@@ -27,6 +26,17 @@ impl TabularNet {
         }
     }
 
+    /// Get all parameters from the network.
+    pub fn get_parameters(&self) -> Vec<f32> {
+        self.network.get_parameters()
+    }
+
+    /// Set all parameters in the network.
+    /// Returns the number of parameters consumed.
+    pub fn set_parameters(&mut self, params: &[f32]) -> Result<usize, Box<dyn std::error::Error>> {
+        self.network.set_parameters(params)
+    }
+
     /// Get the output size of this network
     pub fn output_size(&self) -> usize {
         self.network.output_size()
@@ -42,8 +52,12 @@ impl Module<Vec<f32>, Vec<f32>> for TabularNet {
         self.network.backward(grad_output)
     }
 
-    fn update(&mut self, lr: f32) {
-        self.network.update(lr);
+    fn gradients(&self) -> Vec<f32> {
+        self.network.gradients()
+    }
+
+    fn apply_gradients(&mut self, gradients: &[f32], lr: f32) {
+        self.network.apply_gradients(gradients, lr)
     }
 
     fn zero_grad(&mut self) {

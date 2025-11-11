@@ -17,9 +17,12 @@ pub trait Module<I, O> {
     /// Returns gradients with respect to the input.
     fn backward(&mut self, grad_output: O) -> I;
 
-    /// Update model parameters using accumulated gradients with learning rate `lr`.
-    /// Usually called after one or more backward passes to apply gradient descent.
-    fn update(&mut self, lr: f32);
+    /// Get the gradients of the module's parameters.
+    /// Returns a vector of gradients corresponding to each parameter.
+    fn gradients(&self) -> Vec<f32>;
+
+    /// Apply pre-computed gradients to update parameters.
+    fn apply_gradients(&mut self, gradients: &[f32], learning_rate: f32);
 
     /// Reset accumulated gradients to zero, typically called at the start of a new batch.
     fn zero_grad(&mut self) {

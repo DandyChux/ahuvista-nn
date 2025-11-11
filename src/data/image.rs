@@ -28,7 +28,7 @@ pub struct ImageData {
     pub channel_stds: Vec<f32>,
 
     /// Current index for batch iteration
-    current_idx: usize,
+    pub current_idx: usize,
 }
 
 impl ImageData {

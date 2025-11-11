@@ -27,7 +27,7 @@ pub struct TabularData {
     pub categorical_features: Vec<String>,
 
     /// Current index for batch iteration
-    current_idx: usize,
+    pub current_idx: usize,
 }
 
 impl TabularData {

@@ -198,8 +198,8 @@ mod training_tests {
             (vec![1.0, 1.0], vec![0.0]),
         ];
 
-        let learning_rate = 0.5;
-        let epochs = 100;
+        let learning_rate = 1.0;
+        let epochs = 500;
 
         let mut initial_loss = 0.0;
         let mut final_loss = 0.0;
@@ -218,6 +218,7 @@ mod training_tests {
                     .map(|(o, t)| (o - t).powi(2))
                     .sum();
                 epoch_loss += loss;
+                println!("Epoch {}, Loss: {}", epoch, loss);
 
                 // Backward pass
                 let grad_outputs: Vec<f32> = outputs

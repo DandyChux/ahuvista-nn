@@ -286,10 +286,13 @@ mod temporal_tests {
         fs::create_dir_all(std::path::Path::new(path).parent().unwrap())?;
         let mut file = File::create(path)?;
 
-        writeln!(file, "time,temperature,heart_rate,blood_pressure")?;
-        writeln!(file, "0,36.5,70,120")?;
-        writeln!(file, "1,36.7,72,118")?;
-        writeln!(file, "2,36.8,75,122")?;
+        writeln!(
+            file,
+            "patient_id,timestamp,temperature,heart_rate,blood_pressure"
+        )?;
+        writeln!(file, "1,0,36.5,70,120")?;
+        writeln!(file, "1,1,36.7,72,118")?;
+        writeln!(file, "2,2,36.8,75,122")?;
 
         Ok(())
     }
@@ -314,7 +317,7 @@ mod temporal_tests {
         )
         .unwrap();
 
-        assert_eq!(data.sequences.len(), 1);
+        assert_eq!(data.sequences.len(), 2);
         assert!(data.sequences[0].len() > 0);
 
         // Clean up
@@ -351,8 +354,12 @@ mod temporal_tests {
         // Create shorter sequence
         fs::create_dir_all("tests/data/temporal").ok();
         let mut file2 = File::create(test_file2).unwrap();
-        writeln!(file2, "time,temperature,heart_rate,blood_pressure").unwrap();
-        writeln!(file2, "0,36.5,70,120").unwrap();
+        writeln!(
+            file2,
+            "patient_id,timestamp,temperature,heart_rate,blood_pressure"
+        )
+        .unwrap();
+        writeln!(file2, "1,0,36.5,70,120").unwrap();
 
         let paths = vec![test_file1, test_file2];
         let mut data =

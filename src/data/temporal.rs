@@ -4,6 +4,7 @@
 //! such as patient vitals, lab measurements over time, or sensor readings.
 
 use crate::data::DataLoader;
+use crate::utils::error::{AppError, AppResult};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
@@ -52,7 +53,7 @@ impl TemporalData {
         paths: &[P],
         has_header: bool,
         time_column: Option<String>,
-    ) -> io::Result<Self> {
+    ) -> AppResult<Self> {
         let mut all_sequences = Vec::with_capacity(paths.len());
         let mut feature_names = Vec::new();
         let mut all_values: HashMap<String, Vec<f32>> = HashMap::new();
@@ -100,13 +101,13 @@ impl TemporalData {
                     all_values.insert(name.clone(), Vec::new());
                 }
             } else if file_feature_names != feature_names {
-                return Err(io::Error::new(
+                return Err(AppError::from(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
                         "File {} has different features than previous files",
                         path.as_ref().display()
                     ),
-                ));
+                )));
             }
 
             // If we read the first line to count features, reset the reader
@@ -135,14 +136,14 @@ impl TemporalData {
                 let values: Vec<String> = line.split(',').map(|s| s.trim().to_string()).collect();
 
                 if values.len() != feature_names.len() {
-                    return Err(io::Error::new(
+                    return Err(AppError::from(io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!(
                             "Line has {} values, expected {}",
                             values.len(),
                             feature_names.len()
                         ),
-                    ));
+                    )));
                 }
 
                 // Parse values to floats
@@ -222,16 +223,16 @@ impl TemporalData {
         has_header: bool,
         patient_id_column: String,
         time_column: Option<String>,
-    ) -> io::Result<Self> {
+    ) -> AppResult<Self> {
         let file = File::open(&path)?;
         let reader = BufReader::new(file);
         let mut lines = reader.lines();
 
         // Read header if present
         let header_line = if has_header {
-            lines
-                .next()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Empty CSV file"))??
+            lines.next().ok_or_else(|| {
+                AppError::from(io::Error::new(io::ErrorKind::InvalidData, "Empty CSV file"))
+            })??
         } else {
             String::new()
         };
@@ -262,10 +263,10 @@ impl TemporalData {
                 .iter()
                 .position(|name| name == &patient_id_column)
                 .ok_or_else(|| {
-                    io::Error::new(
+                    AppError::from(io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!("Patient ID column '{}' not found", patient_id_column),
-                    )
+                    ))
                 })?
         };
 
@@ -309,14 +310,11 @@ impl TemporalData {
             let values: Vec<String> = line.split(',').map(|s| s.trim().to_string()).collect();
 
             if values.len() != all_feature_names.len() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "Line has {} values, expected {}",
-                        values.len(),
-                        all_feature_names.len()
-                    ),
-                ));
+                return Err(AppError::DataError(format!(
+                    "Line has {} values, expected {}",
+                    values.len(),
+                    all_feature_names.len()
+                )));
             }
 
             let patient_id = values[patient_id_idx].clone();

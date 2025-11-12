@@ -156,8 +156,6 @@ fn main() -> AppResult<()> {
     // Step 1: Load and preprocess data (only for enabled modalities)
     info!("Loading and preprocessing data...");
 
-    let path = std::env::current_dir()?;
-
     // Load tabular data if enabled
     let tabular_data = if settings.modality_config.use_tabular {
         let data = load_all_tabular_data(&data_config)?;

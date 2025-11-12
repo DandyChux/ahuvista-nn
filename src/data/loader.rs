@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use tracing::info;
 
 use crate::data::{ImageData, TabularData, TemporalData, TextData};
+use crate::utils::error::{AppError, AppResult};
 
 /// Common trait for data loaders that can provide batches of data
 pub trait DataLoader<T> {
@@ -169,23 +170,23 @@ impl Default for DataConfig {
 }
 
 /// Load all tabular data from the tabular subfolder
-pub fn load_all_tabular_data(config: &DataConfig) -> io::Result<TabularData> {
+pub fn load_all_tabular_data(config: &DataConfig) -> AppResult<TabularData> {
     let tabular_dir = config.data_dir.join("tabular");
 
     if !tabular_dir.exists() {
-        return Err(io::Error::new(
+        return Err(AppError::Io(io::Error::new(
             io::ErrorKind::NotFound,
             format!("Tabular data directory not found: {:?}", tabular_dir),
-        ));
+        )));
     }
 
     let csv_files = find_csv_files(&tabular_dir)?;
 
     if csv_files.is_empty() {
-        return Err(io::Error::new(
+        return Err(AppError::Io(io::Error::new(
             io::ErrorKind::InvalidData,
             "No CSV files found in tabular directory",
-        ));
+        )));
     }
 
     info!("  Found {} tabular data files:", csv_files.len());
@@ -205,23 +206,23 @@ pub fn load_all_tabular_data(config: &DataConfig) -> io::Result<TabularData> {
 }
 
 /// Load all temporal data from the temporal subfolder
-pub fn load_all_temporal_data(config: &DataConfig) -> io::Result<TemporalData> {
+pub fn load_all_temporal_data(config: &DataConfig) -> AppResult<TemporalData> {
     let temporal_dir = config.data_dir.join("temporal");
 
     if !temporal_dir.exists() {
-        return Err(io::Error::new(
+        return Err(AppError::Io(io::Error::new(
             io::ErrorKind::NotFound,
             format!("Temporal data directory not found: {:?}", temporal_dir),
-        ));
+        )));
     }
 
     let csv_files = find_csv_files(&temporal_dir)?;
 
     if csv_files.is_empty() {
-        return Err(io::Error::new(
+        return Err(AppError::Io(io::Error::new(
             io::ErrorKind::InvalidData,
             "No CSV files found in temporal directory",
-        ));
+        )));
     }
 
     info!("  Found {} temporal data files:", csv_files.len());
@@ -405,7 +406,7 @@ fn find_image_files_recursive_impl(dir: &Path, files: &mut Vec<PathBuf>) -> io::
 }
 
 /// Merge multiple tabular CSV files based on patient ID
-fn merge_tabular_files(files: &[PathBuf], config: &DataConfig) -> io::Result<TabularData> {
+fn merge_tabular_files(files: &[PathBuf], config: &DataConfig) -> AppResult<TabularData> {
     // This would implement logic to:
     // 1. Read all CSV files
     // 2. Join them on patient ID column
@@ -424,7 +425,7 @@ fn merge_tabular_files(files: &[PathBuf], config: &DataConfig) -> io::Result<Tab
 }
 
 /// Merge multiple temporal CSV files
-fn merge_temporal_files(files: &[PathBuf], config: &DataConfig) -> io::Result<TemporalData> {
+fn merge_temporal_files(files: &[PathBuf], config: &DataConfig) -> AppResult<TemporalData> {
     info!("  Merging {} temporal files...", files.len());
 
     // Would implement logic to combine multiple time series files
@@ -478,7 +479,7 @@ fn load_image_data_from_files(paths: &[PathBuf]) -> io::Result<ImageData> {
 }
 
 /// Load tabular data from a CSV file with appropriate categorical features
-pub fn load_tabular_data<P: AsRef<Path>>(path: P) -> io::Result<TabularData> {
+pub fn load_tabular_data<P: AsRef<Path>>(path: P) -> AppResult<TabularData> {
     // Define which columns should be treated as categorical
     let categorical_features = vec![
         "ethnicity".to_string(),
@@ -493,7 +494,7 @@ pub fn load_tabular_data<P: AsRef<Path>>(path: P) -> io::Result<TabularData> {
 }
 
 /// Load temporal data from a CSV file
-pub fn load_temporal_data<P: AsRef<Path>>(path: P) -> io::Result<TemporalData> {
+pub fn load_temporal_data<P: AsRef<Path>>(path: P) -> AppResult<TemporalData> {
     // Load from a single CSV file where each patient has multiple rows
     // Expects columns: PatientID, Timestamp, and various vital signs/lab values
     TemporalData::from_single_csv(

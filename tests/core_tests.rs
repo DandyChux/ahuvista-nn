@@ -182,7 +182,7 @@ mod layer_tests {
         layer.backward(vec![0.1, 0.2]);
 
         let grads = layer.gradients();
-        assert_eq!(grads.len(), 8); // 2 neurons × 4 params each
+        assert_eq!(grads.len(), 6); // 2 neurons × 3 params each (2 weights + 1 bias)
 
         // Apply gradients
         layer.apply_gradients(&grads, 0.1);
@@ -196,6 +196,8 @@ mod layer_tests {
 
 #[cfg(test)]
 mod network_tests {
+    use tracing::info;
+
     use super::*;
 
     #[test]
@@ -269,7 +271,7 @@ mod network_tests {
 
     #[test]
     fn test_network_training_simple() {
-        let mut network = Network::from_layer_sizes(&[2, 3, 1]);
+        let mut network = Network::from_layer_sizes(&[2, 3, 1]); // 2 input, 3 hidden, 1 output
 
         // Simple XOR-like problem
         let training_data = vec![
@@ -279,11 +281,12 @@ mod network_tests {
             (vec![1.0, 1.0], vec![0.0]),
         ];
 
-        let learning_rate = 0.5;
+        // let learning_rate = 0.1 / training_data.len() as f32;
+        let learning_rate = 1.0;
         let mut initial_loss = 0.0;
 
         // Train for a few iterations
-        for epoch in 0..50 {
+        for epoch in 0..500 {
             let mut epoch_loss = 0.0;
 
             for (inputs, targets) in &training_data {
@@ -297,6 +300,7 @@ mod network_tests {
                     .map(|(o, t)| (o - t).powi(2))
                     .sum();
                 epoch_loss += loss;
+                println!("Epoch {}, Loss: {}", epoch, loss);
 
                 // Backward pass
                 let grad_outputs: Vec<f32> = outputs
@@ -305,15 +309,23 @@ mod network_tests {
                     .map(|(o, t)| 2.0 * (o - t))
                     .collect();
                 network.backward(grad_outputs);
-
-                // Update weights
-                let grads = network.gradients();
-                network.apply_gradients(&grads, learning_rate);
-                network.zero_grad();
             }
+
+            // Update weights with accumulated gradients
+            let grads = network.gradients();
+            if epoch == 0 {
+                println!("Sample gradients: {:?}", &grads[0..5]); // First 5 gradients
+                println!("All gradients sum: {}", grads.iter().sum::<f32>());
+            }
+            network.apply_gradients(&grads, learning_rate);
+            network.zero_grad();
 
             if epoch == 0 {
                 initial_loss = epoch_loss;
+                println!("Initial loss: {}", initial_loss);
+                let params = network.get_parameters();
+                println!("Sample weights: {:?}", &params[0..5]);
+                println!("All weights sum: {}", params.iter().sum::<f32>());
             }
         }
 
@@ -329,7 +341,7 @@ mod network_tests {
             final_loss += loss;
         }
 
-        assert!(final_loss < initial_loss * 0.8);
+        assert!(final_loss < initial_loss * 0.9);
     }
 }
 

@@ -136,11 +136,18 @@ impl Module<Vec<f32>, Vec<f32>> for Network {
     }
 
     fn apply_gradients(&mut self, gradients: &[f32], learning_rate: f32) {
-        // for (layer, gradient) in self.layers.iter_mut().zip(gradients) {
-        //     layer.apply_gradients(gradient, learning_rate);
-        // }
+        let mut offset = 0;
+
         for layer in &mut self.layers {
-            layer.apply_gradients(gradients, learning_rate);
+            let num_params = layer
+                .neurons
+                .iter()
+                .map(|n| n.weights.len() + 1) // weights + bias per neuron
+                .sum::<usize>();
+
+            let layer_gradients = &gradients[offset..offset + num_params];
+            layer.apply_gradients(layer_gradients, learning_rate);
+            offset += num_params;
         }
     }
 

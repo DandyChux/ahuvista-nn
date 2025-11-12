@@ -4,6 +4,7 @@
 //! structured tabular data (e.g., patient demographics, lab values).
 
 use crate::data::DataLoader;
+use crate::utils::error::{AppError, AppResult};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
@@ -56,7 +57,7 @@ impl TabularData {
         path: P,
         has_header: bool,
         categorical_features: &[String],
-    ) -> io::Result<Self> {
+    ) -> AppResult<Self> {
         let file = File::open(&path)?;
         let reader = BufReader::new(file);
         let mut lines = reader.lines();
@@ -103,14 +104,14 @@ impl TabularData {
             let values: Vec<String> = line.split(',').map(|s| s.trim().to_string()).collect();
 
             if values.len() != feature_names.len() {
-                return Err(io::Error::new(
+                return Err(AppError::Io(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
                         "Line has {} values, expected {}",
                         values.len(),
                         feature_names.len()
                     ),
-                ));
+                )));
             }
 
             raw_data.push(values);

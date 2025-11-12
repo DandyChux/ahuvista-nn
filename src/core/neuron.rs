@@ -199,8 +199,20 @@ impl Module<Vec<f32>, f32> for Neuron {
     /// # Returns
     /// The neuron's output after sigmoid activation
     fn forward(&mut self, input: Vec<f32>) -> f32 {
-        // Store inputs for backpropagation
-        self.last_input.clone_from_slice(&input);
+        // Validate input size
+        if input.len() != self.weights.len() {
+            panic!(
+                "Input size mismatch: expected {} inputs, got {}",
+                self.weights.len(),
+                input.len()
+            );
+        }
+
+        // Store inputs for backpropagation - resize if needed
+        if self.last_input.len() != input.len() {
+            self.last_input.resize(input.len(), 0.0);
+        }
+        self.last_input.copy_from_slice(&input);
 
         // Compute and store pre-activation
         let z = self.activate(&input);
@@ -218,6 +230,11 @@ impl Module<Vec<f32>, f32> for Neuron {
     /// # Returns
     /// Vector of gradients with respect to each input
     fn backward(&mut self, grad_output: f32) -> Vec<f32> {
+        // Validate that we have cached inputs
+        if self.last_input.len() != self.weights.len() {
+            panic!("Backward called without proper forward pass");
+        }
+
         let sigmoid_z = Self::sigmoid(self.last_z);
         let sigmoid_derivative = Self::sigmoid_derivative(sigmoid_z);
 
@@ -230,6 +247,11 @@ impl Module<Vec<f32>, f32> for Neuron {
         match &self.weights {
             WeightType::F32(weights) => {
                 for i in 0..weights.len() {
+                    // Bounds check
+                    if i >= self.last_input.len() || i >= self.grad_w.len() {
+                        panic!("Index out of bounds in backward pass");
+                    }
+
                     // Accumulate gradient for weight i
                     self.grad_w[i] += dz * self.last_input[i];
 

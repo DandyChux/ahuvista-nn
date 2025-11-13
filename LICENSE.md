@@ -1,7 +1,7 @@
 # Non-Commercial Research License for AI Models
 ## AhuVista Healthcare Prediction Model
 
-**Copyright (c) [YEAR] [YOUR COMPANY NAME]**
+**Copyright (c) 2025**
 
 ### 1. DEFINITIONS
 
@@ -64,7 +64,7 @@ This license terminates automatically if you violate any terms. Upon termination
 
 ### 10. COMMERCIAL LICENSING
 
-For Commercial Use or Clinical Use, contact: [YOUR EMAIL] for commercial licensing terms.
+For Commercial Use or Clinical Use, contact: ceo.okoroji@outlook.com for commercial licensing terms.
 
 ---
 *This license is based on academic research license principles. For commercial use, please contact us for licensing terms.*

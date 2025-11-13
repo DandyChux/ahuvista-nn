@@ -34,7 +34,7 @@ mod loss_tests {
         let targets = vec![0.6, 0.7, 0.3];
 
         let loss = mean_squared_error(&predictions, &targets);
-        let expected = ((0.1_f32.powi(2) + 0.1_f32.powi(2) + 0.1_f32.powi(2)) / 3.0);
+        let expected = (0.1_f32.powi(2) + 0.1_f32.powi(2) + 0.1_f32.powi(2)) / 3.0;
 
         assert!((loss - expected).abs() < 1e-6);
     }

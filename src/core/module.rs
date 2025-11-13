@@ -1,9 +1,11 @@
 /// Core trait that defines the interface for all neural network modules.
 ///
-/// Modules must implement three primary operations:
+/// Modules must implement five primary operations:
 /// - `forward`: Process inputs and produce outputs
 /// - `backward`: Backpropagate gradients and update internal parameters
-/// - `update`: Apply accumulated gradients to update parameters
+/// - `gradients`: Return the gradients of the module's parameters
+/// - `apply_gradients`: Apply pre-computed gradients to update parameters.
+/// - `zero_grad`: Reset accumulated gradients to zero, typically called at the start of a new batch.
 ///
 /// Type parameters:
 /// - `I`: Input type

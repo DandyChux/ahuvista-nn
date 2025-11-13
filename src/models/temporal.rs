@@ -26,7 +26,7 @@ pub struct SimpleRnnCell {
     pub b_h: Vec<f32>,
 
     /// Cached inputs and hidden states for backpropagation
-    cached_inputs: Vec<Vec<f32>>,
+    pub cached_inputs: Vec<Vec<f32>>,
     pub cached_hiddens: Vec<Vec<f32>>,
 
     /// Accumulated gradients

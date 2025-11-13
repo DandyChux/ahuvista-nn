@@ -1,7 +1,7 @@
 # Ahuvista-NN: Modular Multi-Modal Neural Network for Healthcare
 
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
-[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE.md)
+[![Static Badge](https://img.shields.io/badge/license-Custom-blue)](LICENSE.md)
 
 A lightweight, Rust-based neural network library optimized for multi-modal data processing in low-compute environments, with a focus on maternal health outcome predictions.
 

@@ -4,6 +4,7 @@
 //! text data such as medical notes, patient descriptions, or symptoms.
 
 use crate::data::DataLoader;
+use crate::utils::error::AppResult;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
@@ -51,7 +52,7 @@ impl TextData {
     ///
     /// # Returns
     /// Result containing TextData or an error
-    pub fn from_files<P: AsRef<Path>>(paths: &[P], max_vocab_size: usize) -> io::Result<Self> {
+    pub fn from_files<P: AsRef<Path>>(paths: &[P], max_vocab_size: usize) -> AppResult<Self> {
         let mut documents = Vec::with_capacity(paths.len());
 
         for path in paths {
@@ -72,7 +73,7 @@ impl TextData {
     ///
     /// # Returns
     /// Result containing TextData or an error
-    pub fn from_documents(documents: Vec<String>, max_vocab_size: usize) -> io::Result<Self> {
+    pub fn from_documents(documents: Vec<String>, max_vocab_size: usize) -> AppResult<Self> {
         let mut text_data = TextData {
             documents: documents.clone(),
             token_sequences: Vec::new(),

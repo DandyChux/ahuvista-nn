@@ -20,6 +20,7 @@ A lightweight, Rust-based neural network library optimized for multi-modal data 
 
 - [Installation](#installation)
 - [Quick Start](#quick-start)
+- [Data Loading & Automatic Preparation](#data-loading--automatic-preparation)
 - [Architecture Overview](#architecture-overview)
 - [Training Models](#training-models)
   - [Configuration Files](#1-configuration-file-approach-recommended)
@@ -130,6 +131,95 @@ cargo run --release --bin ahuvista-predict -- \
   --input patient_data.json \
   --output result.json
 ```
+
+## 📊 Data Loading & Automatic Preparation
+
+### Integrated Data Preparation
+
+AHuVista-NN includes **automatic data preparation** that runs seamlessly during training. Simply place your CSV files in the appropriate directories and start training - the system handles everything else!
+
+### How It Works
+
+When you run training, the system automatically:
+
+1. **Scans all modality directories** for CSV files
+2. **Processes various column formats** (case-insensitive, multiple naming conventions)
+3. **Generates patient IDs** if missing
+4. **Merges data** from multiple sources by patient ID
+5. **Creates outcomes** if they don't exist, based on:
+   - Existing outcome columns in your data
+   - Patient risk factors and characteristics
+   - Intelligent cause-of-death assignment for mortality
+
+### Directory Structure
+
+Place your CSV files in these directories:
+
+```
+datasets/
+├── tabular/     # Patient demographics, lab results, risk assessments
+├── temporal/    # Time-series measurements (vitals over time)
+├── text/        # Clinical notes and reports
+├── image/       # Image metadata
+└── outcomes/    # Auto-generated if not present
+```
+
+### Supported Column Formats
+
+The system automatically recognizes various column naming conventions:
+
+#### Tabular Data
+- **Patient ID**: `PatientID`, `patient_id`, `ID`, `id`
+- **Age**: `Age`, `age`, `AGE`
+- **Blood Pressure**: `BloodPressure`, `BP`, `SystolicBP`, `DiastolicBP`
+- **Glucose**: `Glucose`, `glucose`, `BS`, `Blood Sugar`
+- **BMI**: `BMI`, `bmi`, `BodyMassIndex`
+- **Pregnancies**: `Pregnancies`, `pregnancies`, `Gravida`
+- **Risk Level**: `RiskLevel`, `Risk Level`, `risk_level`
+- **Outcome**: `Outcome`, `outcome`, `Mortality`
+
+#### Example CSV Files
+
+**tabular/patient_data.csv:**
+```csv
+PatientID,Age,BloodPressure,Glucose,BMI,Pregnancies
+P001,28,120,95,22.5,2
+P002,35,145,110,28.0,4
+```
+
+**temporal/measurements.csv:**
+```csv
+PatientID,Timestamp,HeartRate,Temperature
+P001,2024-01-01T08:00,72,98.6
+P001,2024-01-01T12:00,75,98.7
+```
+
+**text/clinical_notes.csv:**
+```csv
+PatientID,Notes
+P001,"Mild hypertension noted. Previous pregnancy uncomplicated."
+```
+
+### Automatic Outcome Generation
+
+If outcome files don't exist, the system generates them using:
+
+1. **Risk Scoring**: Analyzes patient characteristics (age, BP, glucose, BMI, etc.)
+2. **Mortality Assignment**: Higher risk scores → higher mortality probability
+3. **Cause Mapping**: Risk factors mapped to likely causes:
+   - High BP → Hypertensive disorders (code 1)
+   - Multiple pregnancies + age → Hemorrhage (code 0)
+   - High glucose → Infection/sepsis (code 2)
+   - High BMI + age → Thromboembolism (code 3)
+   - Other/None → code 4 (includes all survivors)
+
+### Key Benefits
+
+✅ **No separate data preparation step** - just drop files and train  
+✅ **Handles inconsistent formats** - flexible column name matching  
+✅ **Automatic merging** - combines multi-modal data by patient ID  
+✅ **Smart outcome generation** - creates realistic training targets  
+✅ **Incremental updates** - add new files anytime, just re-run training  
 
 ## 🏗️ Architecture Overview
 

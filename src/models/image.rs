@@ -1,4 +1,4 @@
-use crate::core::{Layer, Module};
+use crate::core::{Activation, Layer, Module};
 use ndarray::{s, Array, Array1, Array3, Array4, Axis};
 use rand::Rng;
 
@@ -503,43 +503,73 @@ pub struct ImageNet {
 }
 
 impl ImageNet {
-    /// Create a new image network.
+    /// Create a new image network with custom activations.
     ///
     /// # Arguments
-    /// * `input_channels` - Number of input channels (e.g. 3 for RGB)
+    /// * `input_channels` - Number of input channels (e.g., 3 for RGB)
     /// * `input_height` - Height of input images
     /// * `input_width` - Width of input images
-    /// * `feature_size` - Size of output feature vector
-    pub fn new(input_channels: usize, input_height: usize, input_width: usize) -> Self {
-        // Define a small, efficient CNN
-        let conv1 = Conv2DLayer::new(input_channels, 8, 3, 1, 1);
+    /// * `output_size` - Size of output vector
+    /// * `output_activation` - Optional activation for FC output layer
+    pub fn new(
+        input_channels: usize,
+        input_height: usize,
+        input_width: usize,
+        output_size: usize,
+        output_activation: Option<Activation>,
+    ) -> Self {
+        // First conv: 3 -> 32 channels, 3x3 kernel
+        let conv1 = Conv2DLayer::new(input_channels, 32, 3, 1, 1);
         let pool1 = MaxPool2DLayer::new(2, None);
 
-        let conv2 = Conv2DLayer::new(8, 16, 3, 1, 1);
-        let pool2 = MaxPool2DLayer::new(2, None);
+        // Second conv: 32 -> 64 channels, 3x3 kernel
+        let conv2 = Conv2DLayer::new(32, 64, 3, 1, 1);
+        let pool2 = MaxPool2DLayer::new(2, Some(2));
 
-        // Calculate output dimensions
+        // Calculate flattened size after convolutions
         let (h1, w1) = conv1.output_dimensions(input_height, input_width);
         let (h2, w2) = pool1.output_dimensions(h1, w1);
         let (h3, w3) = conv2.output_dimensions(h2, w2);
         let (h4, w4) = pool2.output_dimensions(h3, w3);
+        let flattened_size = 64 * h4 * w4;
 
-        let flattened_size = 32 * h4 * w4;
-        let output_size = 128;
-
-        // Final output size after flattening
-        let output_size = 16 * h4 * w4;
+        // Create FC layer with specified activation
+        let fc_layer = if let Some(activation) = output_activation {
+            Layer::new(output_size, flattened_size, activation)
+        } else {
+            Layer::new_linear(output_size, flattened_size)
+        };
 
         ImageNet {
             conv1,
             pool1,
             conv2,
             pool2,
-            fc_layer: Layer::new(output_size, flattened_size),
+            fc_layer,
             input_dims: (input_channels, input_height, input_width),
             output_size,
             last_flattened: Vec::new(),
         }
+    }
+
+    /// Create an image network for classification (linear output for cross-entropy).
+    pub fn new_for_classification(
+        input_channels: usize,
+        input_height: usize,
+        input_width: usize,
+        num_classes: usize,
+    ) -> Self {
+        Self::new(input_channels, input_height, input_width, num_classes, None)
+    }
+
+    /// Create an image network for regression (linear output).
+    pub fn new_for_regression(
+        input_channels: usize,
+        input_height: usize,
+        input_width: usize,
+        output_size: usize,
+    ) -> Self {
+        Self::new(input_channels, input_height, input_width, output_size, None)
     }
 
     /// Get all parameters from the network.

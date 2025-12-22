@@ -1,4 +1,4 @@
-use crate::core::{Layer, Module};
+use crate::core::{Activation, Layer, Module};
 
 /// A multi-layer perceptron (MLP) neural network.
 ///
@@ -36,16 +36,28 @@ impl Network {
     /// # Arguments
     /// * `layer_sizes` - Vector of integers where each element is the number of neurons in a layer.
     ///                   The first element is the input size, and the last is the output size.
-    pub fn from_layer_sizes(layer_sizes: &[usize]) -> Self {
+    pub fn from_layer_sizes(
+        layer_sizes: &[usize],
+        hidden_activation: Option<Activation>,
+        output_activation: Option<Activation>,
+    ) -> Self {
         assert!(
             layer_sizes.len() >= 2,
             "Need at least input and output sizes"
         );
 
         let mut network = Network::new();
+        let hidden_act = hidden_activation.unwrap_or(Activation::ReLU);
+        let output_act = output_activation.unwrap_or(Activation::None);
 
         for i in 0..layer_sizes.len() - 1 {
-            let layer = Layer::new(layer_sizes[i + 1], layer_sizes[i]);
+            let activation = if i == layer_sizes.len() - 2 {
+                output_act
+            } else {
+                hidden_act
+            };
+
+            let layer = Layer::new(layer_sizes[i + 1], layer_sizes[i], activation);
             network.add_layer(layer);
         }
 

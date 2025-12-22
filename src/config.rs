@@ -15,6 +15,18 @@ pub struct Settings {
     pub batch_size: usize,
     pub learning_rate: f32,
 
+    // Privacy settings
+    pub use_privacy: bool,
+    pub privacy_epsilon: f32,
+    pub privacy_delta: f32,
+    pub gradient_clip_norm: f32,
+
+    // Adaptive learning rate settings
+    pub use_adaptive_lr: bool,
+    pub lr_decay_rate: f32,
+    pub lr_decay_steps: usize,
+    pub min_learning_rate: f32,
+
     // Model settings
     pub tabular_hidden_sizes: Vec<usize>,
     pub temporal_hidden_size: usize,
@@ -25,11 +37,6 @@ pub struct Settings {
 }
 
 impl Settings {
-    /// Creates a new builder for constructing a `Settings` instance.
-    pub fn new() -> SettingsBuilder {
-        SettingsBuilder::default()
-    }
-
     /// Load settings from a JSON configuration file
     pub fn from_file(path: &str) -> AppResult<Self> {
         let contents = fs::read_to_string(path)?;
@@ -43,9 +50,22 @@ impl Default for Settings {
         Self {
             data_dir: PathBuf::from("datasets"),
             patient_id_column: String::from("PatientID"),
-            epochs: 20,
+            epochs: 50,
             batch_size: 32,
-            learning_rate: 0.001,
+            learning_rate: 0.01,
+
+            // Privacy settings
+            use_privacy: false, // Disabled by default for debugging
+            privacy_epsilon: 10.0,
+            privacy_delta: 1e-5,
+            gradient_clip_norm: 5.0,
+
+            // Adaptive LR settings
+            use_adaptive_lr: true,
+            lr_decay_rate: 0.95,
+            lr_decay_steps: 100,
+            min_learning_rate: 0.001,
+
             tabular_hidden_sizes: vec![128, 64],
             temporal_hidden_size: 128,
             text_embedding_dim: 128,
@@ -164,9 +184,31 @@ impl Default for DataPaths {
 /// Training hyperparameters
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrainingParams {
+    // Training settings
     pub epochs: usize,
     pub batch_size: usize,
     pub learning_rate: f32,
+    pub val_frequency: usize,
+
+    // Privacy settings
+    #[serde(default = "default_use_privacy")]
+    pub use_privacy: bool,
+    #[serde(default = "default_privacy_epsilon")]
+    pub privacy_epsilon: f32,
+    #[serde(default = "default_privacy_delta")]
+    pub privacy_delta: f32,
+    #[serde(default = "default_gradient_clip_norm")]
+    pub gradient_clip_norm: f32,
+
+    // Adaptive LR settings
+    #[serde(default = "default_use_adaptive_lr")]
+    pub use_adaptive_lr: bool,
+    #[serde(default = "default_lr_decay_rate")]
+    pub lr_decay_rate: f32,
+    #[serde(default = "default_lr_decay_steps")]
+    pub lr_decay_steps: usize,
+    #[serde(default = "default_min_learning_rate")]
+    pub min_learning_rate: f32,
 }
 
 impl Default for TrainingParams {
@@ -175,6 +217,15 @@ impl Default for TrainingParams {
             epochs: 20,
             batch_size: 32,
             learning_rate: 0.001,
+            val_frequency: 1,
+            use_privacy: false,
+            privacy_epsilon: 10.0,
+            privacy_delta: 1e-5,
+            gradient_clip_norm: 1.0,
+            use_adaptive_lr: true,
+            lr_decay_rate: 0.95,
+            lr_decay_steps: 100,
+            min_learning_rate: 0.001,
         }
     }
 }
@@ -241,6 +292,14 @@ impl From<AppConfig> for Settings {
             epochs: config.training.epochs,
             batch_size: config.training.batch_size,
             learning_rate: config.training.learning_rate,
+            use_privacy: config.training.use_privacy,
+            privacy_epsilon: config.training.privacy_epsilon,
+            privacy_delta: config.training.privacy_delta,
+            gradient_clip_norm: config.training.gradient_clip_norm,
+            use_adaptive_lr: config.training.use_adaptive_lr,
+            lr_decay_rate: config.training.lr_decay_rate,
+            lr_decay_steps: config.training.lr_decay_steps,
+            min_learning_rate: config.training.min_learning_rate,
             tabular_hidden_sizes: config.model.tabular_hidden_sizes,
             temporal_hidden_size: config.model.temporal_hidden_size,
             text_embedding_dim: config.model.text_embedding_dim,
@@ -249,94 +308,30 @@ impl From<AppConfig> for Settings {
     }
 }
 
-/// A builder for creating `Settings` instances.
-///
-/// This builder allows for selectively overriding default configuration values.
-#[derive(Default)]
-pub struct SettingsBuilder {
-    data_dir: Option<PathBuf>,
-    patient_id_column: Option<String>,
-    epochs: Option<usize>,
-    batch_size: Option<usize>,
-    learning_rate: Option<f32>,
-    tabular_hidden_sizes: Option<Vec<usize>>,
-    temporal_hidden_size: Option<usize>,
-    text_embedding_dim: Option<usize>,
-    modality_config: Option<ModalityConfig>,
+// Default functions
+fn default_use_privacy() -> bool {
+    false
+}
+fn default_privacy_epsilon() -> f32 {
+    10.0
+}
+fn default_privacy_delta() -> f32 {
+    1e-5
+}
+fn default_gradient_clip_norm() -> f32 {
+    1.0
+}
+fn default_use_adaptive_lr() -> bool {
+    true
+}
+fn default_lr_decay_rate() -> f32 {
+    0.95
+}
+fn default_lr_decay_steps() -> usize {
+    100
+}
+fn default_min_learning_rate() -> f32 {
+    0.0001
 }
 
-impl SettingsBuilder {
-    /// Sets the data directory. Default: "datasets".
-    pub fn data_dir(mut self, data_dir: impl Into<PathBuf>) -> Self {
-        self.data_dir = Some(data_dir.into());
-        self
-    }
-
-    /// Sets the patient ID column name. Default: "PatientID".
-    pub fn patient_id_column(mut self, patient_id_column: impl Into<String>) -> Self {
-        self.patient_id_column = Some(patient_id_column.into());
-        self
-    }
-
-    /// Sets the number of training epochs. Default: 20.
-    pub fn epochs(mut self, epochs: usize) -> Self {
-        self.epochs = Some(epochs);
-        self
-    }
-
-    /// Sets the batch size for training. Default: 32.
-    pub fn batch_size(mut self, batch_size: usize) -> Self {
-        self.batch_size = Some(batch_size);
-        self
-    }
-
-    /// Sets the learning rate. Default: 0.001.
-    pub fn learning_rate(mut self, learning_rate: f32) -> Self {
-        self.learning_rate = Some(learning_rate);
-        self
-    }
-
-    /// Sets the hidden layer sizes for the tabular data network. Default: [64, 32].
-    pub fn tabular_hidden_sizes(mut self, tabular_hidden_sizes: Vec<usize>) -> Self {
-        self.tabular_hidden_sizes = Some(tabular_hidden_sizes);
-        self
-    }
-
-    /// Sets the hidden layer size for the temporal data network. Default: 64.
-    pub fn temporal_hidden_size(mut self, temporal_hidden_size: usize) -> Self {
-        self.temporal_hidden_size = Some(temporal_hidden_size);
-        self
-    }
-
-    /// Sets the embedding dimension for the text data. Default: 50.
-    pub fn text_embedding_dim(mut self, text_embedding_dim: usize) -> Self {
-        self.text_embedding_dim = Some(text_embedding_dim);
-        self
-    }
-
-    /// Sets the modality configuration
-    pub fn modality_config(mut self, modality_config: ModalityConfig) -> Self {
-        self.modality_config = Some(modality_config);
-        self
-    }
-
-    /// Builds the `Settings` struct with the specified values,
-    /// falling back to defaults for any unset values.
-    pub fn build(self) -> Settings {
-        Settings {
-            data_dir: self.data_dir.unwrap_or_else(|| PathBuf::from("datasets")),
-            patient_id_column: self
-                .patient_id_column
-                .unwrap_or_else(|| "PatientID".to_string()),
-            epochs: self.epochs.unwrap_or(20),
-            batch_size: self.batch_size.unwrap_or(32),
-            learning_rate: self.learning_rate.unwrap_or(0.001),
-            tabular_hidden_sizes: self.tabular_hidden_sizes.unwrap_or_else(|| vec![64, 32]),
-            temporal_hidden_size: self.temporal_hidden_size.unwrap_or(64),
-            text_embedding_dim: self.text_embedding_dim.unwrap_or(50),
-            modality_config: self.modality_config.unwrap_or_else(ModalityConfig::all),
-        }
-    }
-}
-
-pub static SETTINGS: LazyLock<Settings> = LazyLock::new(|| SettingsBuilder::default().build());
+// pub static SETTINGS: LazyLock<Settings> = LazyLock::new(|| Settings::default());

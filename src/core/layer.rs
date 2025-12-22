@@ -1,4 +1,4 @@
-use crate::core::{Module, Neuron};
+use crate::core::{Activation, Module, Neuron};
 
 /// A layer of neurons in a neural network.
 ///
@@ -8,20 +8,35 @@ use crate::core::{Module, Neuron};
 pub struct Layer {
     /// The neurons in this layer
     pub neurons: Vec<Neuron>,
+
+    /// The activation function used by this layer
+    pub activation: Activation,
 }
 
 impl Layer {
-    /// Create a new layer with the specified number of neurons and inputs per neuron.
+    /// Create a new layer with the specified number of neurons, inputs, and activation.
     ///
     /// # Arguments
     /// * `num_neurons` - Number of neurons in the layer
     /// * `num_inputs_per_neuron` - Number of inputs each neuron receives
-    pub fn new(num_neurons: usize, num_inputs_per_neuron: usize) -> Self {
+    /// * `activation` - Activation function for this layer
+    pub fn new(num_neurons: usize, num_inputs_per_neuron: usize, activation: Activation) -> Self {
         Layer {
             neurons: (0..num_neurons)
-                .map(|_| Neuron::new(num_inputs_per_neuron))
+                .map(|_| Neuron::new(num_inputs_per_neuron, activation))
                 .collect(),
+            activation,
         }
+    }
+
+    /// Create a new layer with sigmoid activation (for backward compatibility).
+    pub fn new_sigmoid(num_neurons: usize, num_inputs_per_neuron: usize) -> Self {
+        Self::new(num_neurons, num_inputs_per_neuron, Activation::Sigmoid)
+    }
+
+    /// Create a new linear layer (no activation) for output layers.
+    pub fn new_linear(num_neurons: usize, num_inputs_per_neuron: usize) -> Self {
+        Self::new(num_neurons, num_inputs_per_neuron, Activation::None)
     }
 
     /// Get the number of neurons in this layer

@@ -2,6 +2,7 @@
 
 use super::TabularData;
 use ndarray::Array3;
+use tracing::info;
 
 /// Split multi-modal data with sample weights into training and validation sets
 pub fn split_data_with_weights(
@@ -32,22 +33,51 @@ pub fn split_data_with_weights(
 ) {
     let total_samples = targets.len();
     let train_size = (total_samples as f32 * train_ratio) as usize;
+    info!("TRAINING SIZE: {}", train_size);
+    info!("TABULAR DATA LENGTH: {}", tabular_data.len());
+    info!("TEMPORAL DATA LENGTH: {}", temporal_data.len());
+    info!("TEXT DATA LENGTH: {}", text_data.len());
+    info!("IMAGE DATA LENGTH: {}", image_data.len());
 
-    // Split tabular data
-    let train_tabular = tabular_data[0..train_size].to_vec();
-    let val_tabular = tabular_data[train_size..].to_vec();
+    // Split tabular data (only if it has data)
+    let (train_tabular, val_tabular) = if !tabular_data.is_empty() {
+        (
+            tabular_data[0..train_size].to_vec(),
+            tabular_data[train_size..].to_vec(),
+        )
+    } else {
+        (vec![], vec![])
+    };
 
-    // Split temporal data
-    let train_temporal = temporal_data[0..train_size].to_vec();
-    let val_temporal = temporal_data[train_size..].to_vec();
+    // Split temporal data (only if it has data)
+    let (train_temporal, val_temporal) = if !temporal_data.is_empty() {
+        (
+            temporal_data[0..train_size].to_vec(),
+            temporal_data[train_size..].to_vec(),
+        )
+    } else {
+        (vec![], vec![])
+    };
 
-    // Split text data
-    let train_text = text_data[0..train_size].to_vec();
-    let val_text = text_data[train_size..].to_vec();
+    // Split text data (only if it has data)
+    let (train_text, val_text) = if !text_data.is_empty() {
+        (
+            text_data[0..train_size].to_vec(),
+            text_data[train_size..].to_vec(),
+        )
+    } else {
+        (vec![], vec![])
+    };
 
-    // Split image data
-    let train_image = image_data[0..train_size].to_vec();
-    let val_image = image_data[train_size..].to_vec();
+    // Split image data (only if it has data)
+    let (train_image, val_image) = if !image_data.is_empty() {
+        (
+            image_data[0..train_size].to_vec(),
+            image_data[train_size..].to_vec(),
+        )
+    } else {
+        (vec![], vec![])
+    };
 
     // Split targets
     let train_targets = targets[0..train_size].to_vec();

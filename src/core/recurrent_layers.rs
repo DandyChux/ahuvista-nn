@@ -1,4 +1,4 @@
-use crate::core::{Layer, Module};
+use crate::core::{Activation, Layer, Module};
 use crate::utils::{sigmoid, sigmoid_derivative, tanh, tanh_derivative};
 use rand::Rng;
 
@@ -39,10 +39,10 @@ impl LSTMLayer {
         let combined_input_size = input_size + hidden_size;
 
         Self {
-            input_gate: Layer::new(hidden_size, combined_input_size),
-            forget_gate: Layer::new(hidden_size, combined_input_size),
-            output_gate: Layer::new(hidden_size, combined_input_size),
-            cell_gate: Layer::new(hidden_size, combined_input_size),
+            input_gate: Layer::new(hidden_size, combined_input_size, Activation::Sigmoid),
+            forget_gate: Layer::new(hidden_size, combined_input_size, Activation::Sigmoid),
+            output_gate: Layer::new(hidden_size, combined_input_size, Activation::Sigmoid),
+            cell_gate: Layer::new(hidden_size, combined_input_size, Activation::Tanh),
             hidden_state: vec![0.0; hidden_size],
             cell_state: vec![0.0; hidden_size],
             cached_inputs: Vec::new(),

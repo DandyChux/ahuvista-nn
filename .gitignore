@@ -38,3 +38,6 @@ Thumbs.db
 *.rs.bk
 *.swp
 *~
+
+# Ignore datasets directory (must provide your own data)
+datasets/

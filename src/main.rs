@@ -23,20 +23,20 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::{
     audit::{AuditLogger, PredictionAuditRecord},
-    config::{AppConfig, ModalityConfig, Settings},
+    config::{AppConfig, ModalityConfig, Settings, TrainingParams},
     core::fusion::{LateFusionNet, MultiModalInput},
     data::{
+        db::DatabaseManager,
         loader::{
-            create_data_loader, load_all_image_data, load_all_outcomes, load_all_tabular_data,
-            load_all_temporal_data, load_all_text_data, DataConfig,
+            DataConfig, create_data_loader, load_all_image_data, load_all_outcomes,
+            load_all_tabular_data, load_all_temporal_data, load_all_text_data,
         },
         preprocessing::{extract_patient_strata, split_data_with_weights},
     },
     training::{
-        balancing::{compute_sample_weights, BayesianCalibrator, CauseWeights, SmoteSynthesizer},
+        balancing::{BayesianCalibrator, CauseWeights, SmoteSynthesizer, compute_sample_weights},
         training_loop::{
             evaluate_by_cause, evaluate_model_with_calibration, train_model_with_weights,
-            TrainingConfig,
         },
     },
     utils::error::{AppError, AppResult},
@@ -49,6 +49,11 @@ struct Args {
     /// Path to configuration file (JSON format)
     #[arg(short, long, value_name = "FILE")]
     config: Option<String>,
+
+    /// Path to the prepared database (created by ahuvista-prepare)
+    /// If not provided, will look for ahuvista.db in current directory
+    #[arg(long, default_value = "ahuvista.db")]
+    database: String,
 
     /// Comma-separated list of modalities to use (overrides config file)
     /// Valid values: tabular,temporal,text,image
@@ -70,6 +75,22 @@ struct Args {
     /// Output directory for model and logs
     #[arg(short, long, default_value = "models")]
     output_dir: String,
+
+    /// Disable differential privacy (for debugging only)
+    #[arg(long)]
+    no_privacy: bool,
+
+    /// Privacy epsilon (default 10.0, smaller = more privacy)
+    #[arg(long)]
+    epsilon: Option<f32>,
+
+    /// Gradient clipping norm (default 5.0)
+    #[arg(long)]
+    clip_norm: Option<f32>,
+
+    /// Enable adaptive learning rate
+    #[arg(long)]
+    adaptive_lr: bool,
 
     /// Enable verbose logging
     #[arg(short, long)]
@@ -128,12 +149,25 @@ fn main() -> AppResult<()> {
     if let Some(learning_rate) = args.learning_rate {
         settings.learning_rate = learning_rate;
     }
+    if args.no_privacy {
+        settings.use_privacy = false;
+        warn!("Privacy DISABLED - for debugging only!");
+    }
+    if let Some(epsilon) = args.epsilon {
+        settings.privacy_epsilon = epsilon;
+    }
+    if let Some(clip_norm) = args.clip_norm {
+        settings.gradient_clip_norm = clip_norm;
+    }
+    if args.adaptive_lr {
+        settings.use_adaptive_lr = true;
+    }
 
     // Validate modality configuration
     settings
         .modality_config
         .validate()
-        .map_err(|e| AppError::from(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
     info!("Configuration:");
     info!(
@@ -143,64 +177,118 @@ fn main() -> AppResult<()> {
     info!("  Epochs: {}", settings.epochs);
     info!("  Batch size: {}", settings.batch_size);
     info!("  Learning rate: {}", settings.learning_rate);
-    info!("  Data directory: {:?}", settings.data_dir);
+    info!("  Database: {:?}", settings.database);
 
-    // Configure data loading
-    let data_config = DataConfig {
-        data_dir: settings.data_dir.clone(),
-        merge_files: true,
-        patient_id_column: settings.patient_id_column.clone(),
-        has_headers: true,
-    };
+    // =========================================================
+    // Step 1: LOAD DATA FROM DATABASE (instead of from files)
+    // =========================================================
 
-    // Step 1: Load and preprocess data (only for enabled modalities)
-    info!("Loading and preprocessing data...");
+    info!("Loading data from database: {}", args.database);
+
+    let db = DatabaseManager::new(&args.database).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "Failed to open database '{}'. Did you run 'ahuvista-prepare' first? Error: {}",
+                args.database, e
+            ),
+        )
+    })?;
+
+    // Check what data is available in the database
+    let counts = db.get_sample_counts().map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("Failed to get sample counts: {}", e),
+        )
+    })?;
+
+    info!("Database contents:");
+    info!("  Tabular samples:  {}", counts.tabular);
+    info!("  Temporal sequences: {}", counts.temporal);
+    info!("  Text documents:   {}", counts.text);
+    info!("  Images:           {}", counts.image);
+    info!("  Outcomes:         {}", counts.outcomes);
+
+    if counts.outcomes == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "No data in database. Run 'ahuvista-prepare --data-dir datasets/' first.",
+        ));
+    }
 
     // Load tabular data if enabled
-    let tabular_data = if settings.modality_config.use_tabular {
-        let data = load_all_tabular_data(&data_config)?;
+    let tabular_data = if settings.modality_config.use_tabular && counts.tabular > 0 {
+        let data = db.load_tabular_data().map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to load tabular data: {}", e),
+            )
+        })?;
         info!(
             "  ✓ Loaded tabular data: {} samples, {} features",
             data.data.len(),
             data.feature_dim()
         );
         Some(data)
+    } else if settings.modality_config.use_tabular {
+        warn!("  ✗ Tabular modality enabled but no data in database");
+        None
     } else {
         info!("  ✗ Tabular modality disabled, skipping");
         None
     };
 
     // Load temporal data if enabled
-    let temporal_data = if settings.modality_config.use_temporal {
-        let data = load_all_temporal_data(&data_config)?;
+    let temporal_data = if settings.modality_config.use_temporal && counts.temporal > 0 {
+        let data = db.load_temporal_data().map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to load temporal data: {}", e),
+            )
+        })?;
         info!(
             "  ✓ Loaded temporal data: {} sequences, {} features per timestep",
             data.sequences.len(),
             data.feature_dim()
         );
         Some(data)
+    } else if settings.modality_config.use_temporal {
+        warn!("  ✗ Temporal modality enabled but no data in database");
     } else {
         info!("  ✗ Temporal modality disabled, skipping");
         None
     };
 
     // Load text data if enabled
-    let text_data = if settings.modality_config.use_text {
-        let data = load_all_text_data(&data_config)?;
+    let text_data = if settings.modality_config.use_text && counts.text > 0 {
+        let data = db.load_text_data().map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to load text data: {}", e),
+            )
+        })?;
         info!(
             "  ✓ Loaded text data: {} documents, vocabulary size {}",
             data.documents.len(),
             data.vocab_size()
         );
         Some(data)
+    } else if settings.modality_config.use_text {
+        warn!("  ✗ Text modality enabled but no data in database");
     } else {
         info!("  ✗ Text modality disabled, skipping");
         None
     };
 
     // Load image data if enabled
-    let image_data = if settings.modality_config.use_image {
-        let data = load_all_image_data(&data_config)?;
+    let image_data = if settings.modality_config.use_image && counts.image > 0 {
+        let data = db.load_image_data().map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to load image data: {}", e),
+            )
+        })?;
         info!(
             "  ✓ Loaded image data: {} images, size {}x{}",
             data.images.len(),
@@ -208,20 +296,70 @@ fn main() -> AppResult<()> {
             data.image_size.1
         );
         Some(data)
+    } else if settings.modality_config.use_image {
+        warn!("  ✗ Image modality enabled but no data in database");
     } else {
         info!("  ✗ Image modality disabled, skipping");
         None
     };
 
-    // Load target values and mortality causes
-    let (targets, causes) = load_all_outcomes(&data_config)?;
-    info!("  Loaded outcomes: {} patients", targets.len());
+    // Load outcomes from database
+    let (all_targets, all_causes) = db.load_outcomes().map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("Failed to load outcomes: {}", e),
+        )
+    })?;
+    info!("  Loaded outcomes: {} patients", all_targets.len());
+
+    // Determine the actual number of samples based on enabled modalities
+    let num_samples = if let Some(ref tab_data) = tabular_data {
+        tab_data.data.len()
+    } else if let Some(ref temp_data) = temporal_data {
+        temp_data.sequences.len()
+    } else if let Some(ref txt_data) = text_data {
+        txt_data.documents.len()
+    } else if let Some(ref img_data) = image_data {
+        img_data.images.len()
+    } else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "No data loaded for any enabled modality",
+        ));
+    };
+
+    // Truncate targets and causes to match the data size (assuming patient ordering is consistent across files)
+    let targets = all_targets
+        .into_iter()
+        .take(num_samples)
+        .collect::<Vec<_>>();
+    let causes = all_causes.into_iter().take(num_samples).collect::<Vec<_>>();
+
+    info!("  Using {} samples with matching targets", num_samples);
 
     // Validate that we have data for all enabled modalities
     if settings.modality_config.use_tabular && tabular_data.is_none() {
         return Err(AppError::from(std::io::Error::new(
             std::io::ErrorKind::Other,
             "Tabular modality enabled but no data loaded",
+        )));
+    }
+    if settings.modality_config.use_image && image_data.is_none() {
+        return Err(AppError::from(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "Image modality enabled but no data loaded",
+        )));
+    }
+    if settings.modality_config.use_text && text_data.is_none() {
+        return Err(AppError::from(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "Text modality enabled but no data loaded",
+        )));
+    }
+    if settings.modality_config.use_temporal && temporal_data.is_none() {
+        return Err(AppError::from(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "Temporal modality enabled but no data loaded",
         )));
     }
 
@@ -266,8 +404,32 @@ fn main() -> AppResult<()> {
     let sample_weights =
         SmoteSynthesizer::apply_cause_weights(&base_sample_weights, &causes, &cause_weights);
 
+    // Calculate actual prevalence from the data
+    let positive_samples = targets.iter().filter(|&&t| t > 0.5).count();
+    let total_samples = targets.len();
+    let actual_prevalence = positive_samples as f32 / total_samples as f32;
+
+    info!(
+        "Dataset statistics: {} positive samples out of {} total ({:.2}% prevalence)",
+        positive_samples,
+        total_samples,
+        actual_prevalence * 100.0
+    );
+
+    // Create Bayesian calibrator with actual prevalence or a reasonable estimate
+    // For maternal mortality, typical rates are 0.5-2% in developed countries
+    let calibration_prevalence = if actual_prevalence > 0.0 {
+        actual_prevalence.max(0.005) // Use at least 0.5% to avoid over-calibration
+    } else {
+        0.01 // Default to 1% if no positive samples (shouldn't happen but just in case)
+    };
+
     // Create Bayesian calibrator
-    let calibrator = BayesianCalibrator::new(0.001); // 0.1% prevalence
+    let calibrator = BayesianCalibrator::new(calibration_prevalence);
+    info!(
+        "Using calibration prevalence: {:.2}%",
+        calibration_prevalence * 100.0
+    );
 
     // Step 3: Split data into training and validation sets
     let tabular_vec = tabular_data
@@ -382,12 +544,7 @@ fn main() -> AppResult<()> {
     // Step 7: Train the model
     info!("Training model with population-weighted samples...");
 
-    let training_config = TrainingConfig {
-        epochs: settings.epochs,
-        batch_size: settings.batch_size,
-        learning_rate: settings.learning_rate,
-        val_frequency: 1,
-    };
+    let training_config = TrainingParams::default();
 
     train_model_with_weights(
         &mut model,
@@ -473,22 +630,8 @@ fn main() -> AppResult<()> {
 
     std::fs::create_dir_all(&args.output_dir)?;
     let model_path = format!("{}/maternal_mortality_model_modular.bin", args.output_dir);
-
-    match model.save(&model_path) {
-        Ok(_) => info!("  ✓ Model saved successfully to {}", model_path),
-        Err(e) => {
-            error!("  ✗ Failed to save model: {}", e);
-            return Err(AppError::from(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Failed to save model: {}", e),
-            )));
-        }
-    }
-
-    info!("Training complete!");
-    info!("Model configuration:");
-    info!("  Modalities: {:?}", model.enabled_modalities());
-    info!("  Output: {}", model_path);
+    model.save(&model_path)?;
+    info!("  Model saved to: {}", model_path);
 
     Ok(())
 }

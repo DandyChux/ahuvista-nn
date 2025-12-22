@@ -14,19 +14,14 @@ use std::path::Path;
 pub struct TabularData {
     /// The processed feature vectors
     pub data: Vec<Vec<f32>>,
-
     /// Feature names
     pub feature_names: Vec<String>,
-
     /// Statistics for each numeric feature (mean, std_dev)
     pub numeric_stats: HashMap<String, (f32, f32)>,
-
     /// Mapping for each categorical feature (value -> index)
     pub categorical_mappings: HashMap<String, HashMap<String, usize>>,
-
     /// Which features are categorical (vs numeric)
     pub categorical_features: Vec<String>,
-
     /// Current index for batch iteration
     pub current_idx: usize,
 }

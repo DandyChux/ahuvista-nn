@@ -4,6 +4,7 @@
 //! data from different sources (tabular, temporal, text, image) to be used
 //! with the multi-modal neural network.
 
+pub mod db;
 pub mod image;
 pub mod loader;
 pub mod preprocessing;

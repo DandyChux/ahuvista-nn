@@ -11,6 +11,7 @@ pub enum AppError {
     /// Domain Error is related to business logic or data validation
     DomainError(String),
     ImageError(image::ImageError),
+    SqliteError(rusqlite::Error),
 }
 
 impl Display for AppError {
@@ -24,6 +25,7 @@ impl Display for AppError {
             AppError::JsonError(msg) => write!(f, "JSON processing error: {}", msg),
             AppError::DomainError(msg) => write!(f, "Domain error: {}", msg),
             AppError::ImageError(msg) => write!(f, "Image processing error: {}", msg),
+            AppError::SqliteError(msg) => write!(f, "SQLite error: {}", msg),
         }
     }
 }
@@ -66,6 +68,7 @@ impl_from_error!(serde_json::Error, JsonError);
 impl_from_error!(String, DomainError);
 impl_from_error!(image::ImageError, ImageError);
 impl_from_error!(std::string::FromUtf8Error => DomainError as String);
+impl_from_error!(rusqlite::Error, SqliteError);
 
 impl std::error::Error for AppError {}
 

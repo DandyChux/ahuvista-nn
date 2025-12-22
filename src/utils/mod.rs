@@ -20,9 +20,14 @@ pub fn tanh_derivative(tanh_x: f32) -> f32 {
     1.0 - tanh_x.powi(2)
 }
 
-pub fn initialize_weights(num_weights: usize) -> Vec<f64> {
-    let mut rng = rand::rng();
-    (0..num_weights)
-        .map(|_| rng.random_range(-1.0..1.0))
-        .collect()
+pub fn relu(x: f32) -> f32 {
+    x.max(0.0)
+}
+
+pub fn relu_derivative(relu_x: f32) -> f32 {
+    if relu_x > 0.0 {
+        1.0
+    } else {
+        0.0
+    }
 }

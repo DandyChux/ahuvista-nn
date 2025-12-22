@@ -4,6 +4,7 @@
 //! image data such as medical scans, photographs, or visualizations.
 
 use crate::data::DataLoader;
+use crate::utils::error::AppResult;
 use image::{DynamicImage, GenericImageView, ImageBuffer, ImageReader, Rgb};
 use ndarray::{Array3, Axis};
 use std::fs::File;
@@ -57,7 +58,7 @@ impl ImageData {
         paths: &[P],
         target_size: (usize, usize),
         grayscale: bool,
-    ) -> io::Result<Self> {
+    ) -> AppResult<Self> {
         let mut images = Vec::with_capacity(paths.len());
         let channels = if grayscale { 1 } else { 3 };
 
@@ -175,7 +176,7 @@ impl ImageData {
     }
 
     /// Preprocess a new image (for inference)
-    pub fn preprocess_image<P: AsRef<Path>>(&self, path: P) -> io::Result<Array3<f32>> {
+    pub fn preprocess_image<P: AsRef<Path>>(&self, path: P) -> AppResult<Array3<f32>> {
         let img = ImageReader::open(path)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
             .decode()

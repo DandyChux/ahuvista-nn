@@ -35,6 +35,19 @@ impl Iterator for WeightType {
     }
 }
 
+/// Activation function type for neurons
+#[derive(Debug, Clone, Copy)]
+pub enum Activation {
+    /// No activation (linear/identity) - used for output layer logits
+    None,
+    /// Sigmoid activation - used for hidden layers
+    Sigmoid,
+    /// Tanh activation - alternative for hidden layers
+    Tanh,
+    /// ReLU activation - alternative for hidden layers
+    ReLU,
+}
+
 /// The basic computational unit of a neural network.
 ///
 /// A `Neuron` has weights for each input, a bias term, and applies
@@ -48,11 +61,17 @@ pub struct Neuron {
     /// Bias term
     pub bias: f32,
 
+    /// Activation function to apply
+    pub activation: Activation,
+
     /// Cached input from last forward pass
     last_input: Vec<f32>,
 
     /// Cached pre-activation value from last forward pass
     last_z: f32,
+
+    /// Cached post-activation value from last forward pass (for backward)
+    last_output: f32,
 
     /// Accumulated gradients for weights
     grad_w: Vec<f32>,
@@ -62,28 +81,50 @@ pub struct Neuron {
 }
 
 impl Neuron {
-    /// Create a new neuron with the specified number of inputs.
+    /// Create a new neuron with the specified number of inputs and activation.
     ///
-    /// Weights and bias are initialized randomly in the range [-0.5, 0.5],
-    /// which helps prevent saturation early in training.
+    /// Weights are initialized using Xavier/Glorot initialization.
     ///
     /// # Arguments
     /// * `num_inputs` - The number of input connections
-    pub fn new(num_inputs: usize) -> Self {
+    /// * `activation` - The activation function to use
+    pub fn new(num_inputs: usize, activation: Activation) -> Self {
         let mut rng = rand::rng();
+
+        // Xavier/Glorot initialization
+        // For sigmoid/tanh: sqrt(2 / (fan_in + fan_out))
+        // For ReLU: sqrt(2 / fan_in)
+        // For linear: sqrt(1 / fan_in)
+        let std = match activation {
+            Activation::ReLU => (2.0 / num_inputs as f32).sqrt(),
+            Activation::Sigmoid | Activation::Tanh => (2.0 / (num_inputs as f32 + 1.0)).sqrt(),
+            Activation::None => (1.0 / num_inputs as f32).sqrt(),
+        };
 
         Neuron {
             weights: WeightType::F32(
                 (0..num_inputs)
-                    .map(|_| rng.random_range(-0.5..0.5))
+                    .map(|_| rng.random_range(-std..std))
                     .collect(),
             ),
-            bias: rng.random_range(-0.5..0.5),
+            bias: 0.0,
+            activation,
             last_input: vec![0.0; num_inputs],
             last_z: 0.0,
+            last_output: 0.0,
             grad_w: vec![0.0; num_inputs],
             grad_b: 0.0,
         }
+    }
+
+    /// Create a new neuron with sigmoid activation (for backward compatibility).
+    pub fn new_sigmoid(num_inputs: usize) -> Self {
+        Self::new(num_inputs, Activation::Sigmoid)
+    }
+
+    /// Create a new neuron with linear activation (for output layers).
+    pub fn new_linear(num_inputs: usize) -> Self {
+        Self::new(num_inputs, Activation::None)
     }
 
     /// Get all parameters (weights and bias) as a flat vector.
@@ -146,10 +187,7 @@ impl Neuron {
     }
 
     /// Compute the weighted sum of inputs plus bias (pre-activation).
-    ///
-    /// # Arguments
-    /// * `inputs` - Input values to the neuron
-    fn activate(&self, inputs: &[f32]) -> f32 {
+    fn linear_combination(&self, inputs: &[f32]) -> f32 {
         match &self.weights {
             WeightType::F32(weights) => {
                 inputs
@@ -173,20 +211,24 @@ impl Neuron {
         }
     }
 
-    /// Apply the sigmoid activation function to a value.
-    ///
-    /// # Arguments
-    /// * `x` - The value to apply the sigmoid function to
-    fn sigmoid(x: f32) -> f32 {
-        crate::utils::sigmoid(x)
+    /// Apply the activation function.
+    fn apply_activation(&self, x: f32) -> f32 {
+        match self.activation {
+            Activation::None => x,
+            Activation::Sigmoid => crate::utils::sigmoid(x),
+            Activation::Tanh => crate::utils::tanh(x),
+            Activation::ReLU => crate::utils::relu(x),
+        }
     }
 
-    /// Compute the derivative of the sigmoid function.
-    ///
-    /// # Arguments
-    /// * `x` - The sigmoid output value to compute the derivative at
-    fn sigmoid_derivative(x: f32) -> f32 {
-        crate::utils::sigmoid_derivative(x)
+    /// Compute the derivative of the activation function.
+    fn activation_derivative(&self, x: f32, output: f32) -> f32 {
+        match self.activation {
+            Activation::None => 1.0,
+            Activation::Sigmoid => crate::utils::sigmoid_derivative(output),
+            Activation::Tanh => crate::utils::tanh_derivative(output),
+            Activation::ReLU => crate::utils::relu_derivative(x),
+        }
     }
 }
 
@@ -208,18 +250,21 @@ impl Module<Vec<f32>, f32> for Neuron {
             );
         }
 
-        // Store inputs for backpropagation - resize if needed
+        // Store inputs for backpropagation
         if self.last_input.len() != input.len() {
             self.last_input.resize(input.len(), 0.0);
         }
         self.last_input.copy_from_slice(&input);
 
-        // Compute and store pre-activation
-        let z = self.activate(&input);
+        // Compute pre-activation
+        let z = self.linear_combination(&input);
         self.last_z = z;
 
-        // Apply sigmoid activation
-        Self::sigmoid(z)
+        // Apply activation and store output
+        let output = self.apply_activation(z);
+        self.last_output = output;
+
+        output
     }
 
     /// Backpropagate gradients through this neuron.
@@ -235,23 +280,18 @@ impl Module<Vec<f32>, f32> for Neuron {
             panic!("Backward called without proper forward pass");
         }
 
-        let sigmoid_z = Self::sigmoid(self.last_z);
-        let sigmoid_derivative = Self::sigmoid_derivative(sigmoid_z);
+        // Compute activation derivative
+        let activation_deriv = self.activation_derivative(self.last_z, self.last_output);
 
         // Gradient of loss with respect to pre-activation z
-        let dz = grad_output * sigmoid_derivative;
+        let dz = grad_output * activation_deriv;
 
-        // Gradient with respect to each weight
+        // Gradient with respect to each weight and input
         let mut grad_inputs = vec![0.0; self.weights.len()];
 
         match &self.weights {
             WeightType::F32(weights) => {
                 for i in 0..weights.len() {
-                    // Bounds check
-                    if i >= self.last_input.len() || i >= self.grad_w.len() {
-                        panic!("Index out of bounds in backward pass");
-                    }
-
                     // Accumulate gradient for weight i
                     self.grad_w[i] += dz * self.last_input[i];
 

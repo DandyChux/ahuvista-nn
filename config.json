@@ -20,7 +20,14 @@
 	"training": {
 		"epochs": 50,
 		"batch_size": 32,
-		"learning_rate": 0.001
+		"learning_rate": 0.001,
+		"use_privacy": false,
+		"privacy_epsilon": 10.0,
+		"gradient_clip_norm": 5.0,
+		"use_adaptive_lr": true,
+		"lr_decay_rate": 0.95,
+		"lr_decay_steps": 100,
+		"min_learning_rate": 0.001
 	},
 	"model": {
 		"tabular_hidden_sizes": [

@@ -1,8 +1,8 @@
 use super::Module;
 use crate::data::MultiModalBatch; // or your data structures
 use crate::training::metrics::{evalute_auroc, EvaluationMetrics};
+use rand::rng;
 use rand::seq::SliceRandom;
-use rand::thread_rng;
 use std::collections::HashMap;
 
 /// Calculates feature importance by measuring performance drop when a feature is shuffled.
@@ -19,7 +19,7 @@ pub fn calculate_permutation_importance<I, O>(
 
         // Shuffle the i-th column (feature) of the tabular data
         let mut feature_column: Vec<_> = perturbed_data.tabular.iter().map(|row| row[i]).collect();
-        feature_column.shuffle(&mut thread_rng());
+        feature_column.shuffle(&mut rng());
 
         for (j, row) in perturbed_data.tabular.iter_mut().enumerate() {
             row[i] = feature_column[j];

@@ -164,7 +164,7 @@ impl TemporalNet {
     pub fn new(input_size: usize, hidden_size: usize, output_size: usize) -> Self {
         Self {
             lstm_layer: LSTMLayer::new(input_size, hidden_size),
-            output_layer: Layer::new(output_size, hidden_size), // Takes final hidden state as input
+            output_layer: Layer::new_linear(output_size, hidden_size), // Takes final hidden state as input
         }
     }
 

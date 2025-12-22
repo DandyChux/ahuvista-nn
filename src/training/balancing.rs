@@ -205,7 +205,7 @@ impl SmoteSynthesizer {
         let minority_indices: Vec<usize> = targets
             .iter()
             .enumerate()
-            .filter(|(_, &target)| target > 0.5)
+            .filter(|&(_, &target)| target > 0.5)
             .map(|(i, _)| i)
             .collect();
 
@@ -338,41 +338,40 @@ impl BayesianCalibrator {
 /// # Returns
 /// (weighted_loss, weighted_gradients)
 pub fn weighted_binary_cross_entropy(
-    model_predictions: &[f32],
+    logits: &[f32],
     targets: &[f32],
     sample_weights: &[f32],
 ) -> (f32, Vec<f32>) {
-    assert_eq!(
-        model_predictions.len(),
-        targets.len(),
-        "Predictions and targets must have same length"
-    );
-    assert_eq!(
-        model_predictions.len(),
-        sample_weights.len(),
-        "Predictions and weights must have same length"
-    );
+    assert_eq!(logits.len(), targets.len());
+    assert_eq!(logits.len(), sample_weights.len());
 
     let mut total_weighted_loss = 0.0;
-    let mut weighted_gradients = Vec::with_capacity(model_predictions.len());
+    let mut weighted_gradients = Vec::with_capacity(logits.len());
 
-    for i in 0..model_predictions.len() {
-        let pred = model_predictions[i].max(1e-7).min(1.0 - 1e-7); // Clip prediction
+    for i in 0..logits.len() {
+        let z = logits[i];
         let target = targets[i];
         let weight = sample_weights[i];
 
-        // Calculate BCE loss for this sample
-        let loss = -target * pred.ln() - (1.0 - target) * (1.0 - pred).ln();
+        // Numerically stable BCE loss calculation
+        // loss = max(z, 0) - z * y + log(1 + exp(-|z|))
+        let loss = if z >= 0.0 {
+            z - z * target + (1.0 + (-z).exp()).ln()
+        } else {
+            -z * target + (1.0 + z.exp()).ln()
+        };
+
         let weighted_loss = loss * weight;
         total_weighted_loss += weighted_loss;
 
-        // Calculate gradient and apply weight
-        let grad = (pred - target) / (pred * (1.0 - pred));
+        // Calculate gradient: p - y where p = sigmoid(z)
+        let p = 1.0 / (1.0 + (-z).exp());
+        let grad = p - target;
         let weighted_grad = grad * weight;
         weighted_gradients.push(weighted_grad);
     }
 
-    let mean_weighted_loss = total_weighted_loss / model_predictions.len() as f32;
+    let mean_weighted_loss = total_weighted_loss / logits.len() as f32;
 
     (mean_weighted_loss, weighted_gradients)
 }

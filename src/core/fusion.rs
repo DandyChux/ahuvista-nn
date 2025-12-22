@@ -1,5 +1,5 @@
 use crate::config::ModalityConfig;
-use crate::core::{Layer, Module, Network};
+use crate::core::{Activation, Layer, Module, Network};
 use crate::models::{ImageNet, TabularNet, TemporalNet, TextNet};
 use crate::utils::error::{AppError, AppResult};
 use ndarray::{Array3, ArrayBase};
@@ -142,7 +142,13 @@ impl LateFusionNet {
             let (input_size, hidden_sizes, output_size) = tabular_params
                 .ok_or("Tabular parameters required when tabular modality is enabled")?;
             tabular_output_size = output_size;
-            Some(TabularNet::new(input_size, &hidden_sizes, output_size))
+            Some(TabularNet::new(
+                input_size,
+                &hidden_sizes,
+                output_size,
+                Some(Activation::ReLU),
+                None,
+            ))
         } else {
             None
         };
@@ -168,7 +174,9 @@ impl LateFusionNet {
         let image_net = if config.use_image {
             let (channels, height, width) =
                 image_params.ok_or("Image parameters required when image modality is enabled")?;
-            let net = ImageNet::new(channels, height, width);
+            // Use a fixed output size for image features (e.g. 128)
+            let image_feature_size = 128;
+            let net = ImageNet::new(channels, height, width, image_feature_size, None);
             image_output_size = net.output_size();
             Some(net)
         } else {
@@ -188,12 +196,12 @@ impl LateFusionNet {
         let mut prev_size = fused_size;
 
         for &size in classifier_hidden_sizes {
-            classifier.add_layer(Layer::new(size, prev_size));
+            classifier.add_layer(Layer::new(size, prev_size, Activation::ReLU));
             prev_size = size;
         }
 
         // Final output layer (single neuron for binary classification)
-        classifier.add_layer(Layer::new(1, prev_size));
+        classifier.add_layer(Layer::new_linear(1, prev_size));
 
         Ok(LateFusionNet {
             config,
@@ -619,12 +627,36 @@ impl Module<(Vec<f32>, Vec<Vec<f32>>, Vec<usize>, Array3<f32>), Vec<f32>> for La
         let text_size = text_features.len();
         let image_size = image_features.len();
 
-        let grad_tabular = grad_fused[0..tabular_size].to_vec();
-        let grad_temporal = grad_fused[tabular_size..(tabular_size + temporal_size)].to_vec();
-        let grad_text = grad_fused
-            [(tabular_size + temporal_size)..(tabular_size + temporal_size + text_size)]
-            .to_vec();
-        let grad_image = grad_fused[(tabular_size + temporal_size + text_size)..].to_vec();
+        // Only slice if the modality has features
+        let grad_tabular = if tabular_size > 0 {
+            grad_fused[0..tabular_size].to_vec()
+        } else {
+            vec![]
+        };
+
+        let mut offset = tabular_size;
+
+        let grad_temporal = if temporal_size > 0 {
+            let g = grad_fused[offset..(offset + temporal_size)].to_vec();
+            offset += temporal_size;
+            g
+        } else {
+            vec![]
+        };
+
+        let grad_text = if text_size > 0 {
+            let g = grad_fused[offset..(offset + text_size)].to_vec();
+            offset += text_size;
+            g
+        } else {
+            vec![]
+        };
+
+        let grad_image = if image_size > 0 {
+            grad_fused[offset..].to_vec()
+        } else {
+            vec![]
+        };
 
         // Backpropagate through each subnetwork
         let tabular_grad = if let Some(ref mut net) = self.tabular_net {
@@ -672,19 +704,42 @@ impl Module<(Vec<f32>, Vec<Vec<f32>>, Vec<usize>, Array3<f32>), Vec<f32>> for La
     }
 
     fn apply_gradients(&mut self, gradients: &[f32], learning_rate: f32) {
+        let mut offset = 0;
+
         if let Some(ref mut net) = self.tabular_net {
-            net.apply_gradients(gradients, learning_rate);
+            let param_count = net.get_parameters().len();
+            if offset + param_count <= gradients.len() {
+                net.apply_gradients(&gradients[offset..offset + param_count], learning_rate);
+                offset += param_count;
+            }
         }
         if let Some(ref mut net) = self.temporal_net {
-            net.apply_gradients(gradients, learning_rate);
+            let param_count = net.get_parameters().len();
+            if offset + param_count <= gradients.len() {
+                net.apply_gradients(&gradients[offset..offset + param_count], learning_rate);
+                offset += param_count;
+            }
         }
         if let Some(ref mut net) = self.text_net {
-            net.apply_gradients(gradients, learning_rate);
+            let param_count = net.get_parameters().len();
+            if offset + param_count <= gradients.len() {
+                net.apply_gradients(&gradients[offset..offset + param_count], learning_rate);
+                offset += param_count;
+            }
         }
         if let Some(ref mut net) = self.image_net {
-            net.apply_gradients(gradients, learning_rate);
+            let param_count = net.get_parameters().len();
+            if offset + param_count <= gradients.len() {
+                net.apply_gradients(&gradients[offset..offset + param_count], learning_rate);
+                offset += param_count;
+            }
         }
-        self.classifier.apply_gradients(gradients, learning_rate);
+
+        // Apply remaining gradients to classifier
+        if offset < gradients.len() {
+            self.classifier
+                .apply_gradients(&gradients[offset..], learning_rate);
+        }
     }
 
     fn zero_grad(&mut self) {

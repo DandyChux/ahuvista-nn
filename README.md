@@ -67,24 +67,41 @@ cargo test --release
 
 ### Compiled Binaries
 
-After building, you'll find two binaries in `target/release/`:
+After building, you'll find three binaries in `target/release/`:
 
-- **`ahuvista-train`**: Training binary with full configuration options
+- **`ahuvista-prepare`**: Data preparation binary - loads CSV files and stores in SQLite database
+- **`ahuvista-train`**: Training binary - loads data from database and trains models
 - **`ahuvista-predict`**: Lightweight inference binary for production deployment
 
 ### Verify Installation
 
 ```bash
+# Check data preparation binary
+cargo run --release --bin ahuvista-prepare -- --help
+
 # Check training binary
 cargo run --release --bin ahuvista-train -- --help
 
 # Check prediction binary
 cargo run --release --bin ahuvista-predict -- --help
+
 ```
 
 ## 🏃 Quick Start
 
-### 1. Train a Simple Model (Tabular Data Only)
+### 1. Prepare Your Data
+
+First, prepare your CSV data and store it in the database:
+
+```bash
+# Prepare all modalities from the datasets directory
+cargo run --release --bin ahuvista-prepare -- \
+  --data-dir datasets \
+  --database ahuvista.db \
+  --verbose
+```
+
+### 2. Train a Simple Model (Tabular Data Only)
 
 ```bash
 # Train with minimal configuration
@@ -95,7 +112,7 @@ cargo run --release --bin ahuvista-train -- \
   --verbose
 ```
 
-### 2. Train with Multiple Modalities
+### 3. Train with Multiple Modalities
 
 ```bash
 # Train with tabular and temporal data
@@ -107,7 +124,7 @@ cargo run --release --bin ahuvista-train -- \
   --output-dir ./models
 ```
 
-### 3. Make a Prediction
+### 4. Make a Prediction
 
 First, create an input file `patient_data.json`:
 
@@ -132,36 +149,76 @@ cargo run --release --bin ahuvista-predict -- \
   --output result.json
 ```
 
-## 📊 Data Loading & Automatic Preparation
+## 📊 Data Pipeline: Prepare → Train → Predict
 
-### Integrated Data Preparation
+AHuVista-NN uses a **three-stage pipeline** for data handling:
 
-AHuVista-NN includes **automatic data preparation** that runs seamlessly during training. Simply place your CSV files in the appropriate directories and start training - the system handles everything else!
+### Pipeline Overview
 
-### How It Works
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│  ahuvista-      │     │  ahuvista-      │     │  ahuvista-      │
+│  prepare        │ ──▶ │  train          │ ──▶ │  predict        │
+│                 │     │                 │     │                 │
+│  CSV files      │     │  SQLite DB      │     │  Trained model  │
+│  ──────────▶    │     │  ──────────▶    │     │  ──────────▶    │
+│  SQLite DB      │     │  Model file     │     │  Predictions    │
+└─────────────────┘     └─────────────────┘     └─────────────────┘
 
-When you run training, the system automatically:
+### Stage 1: Data Preparation (`ahuvista-prepare`)
 
-1. **Scans all modality directories** for CSV files
-2. **Processes various column formats** (case-insensitive, multiple naming conventions)
-3. **Generates patient IDs** if missing
-4. **Merges data** from multiple sources by patient ID
-5. **Creates outcomes** if they don't exist, based on:
-   - Existing outcome columns in your data
-   - Patient risk factors and characteristics
-   - Intelligent cause-of-death assignment for mortality
+Loads CSV files from the datasets directory, normalizes data, and stores in SQLite:
+
+```bash
+cargo run --release --bin ahuvista-prepare -- \
+  --data-dir datasets \
+  --database ahuvista.db \
+  --verbose
+```
+
+Options:**
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--data-dir` | Path to datasets directory | `datasets` |
+| `--database` | Output SQLite database path | `ahuvista.db` |
+| `--patient-id-column` | Name of patient ID column | `PatientID` |
+| `--modalities` | Which modalities to prepare | all |
+| `--clear` | Clear existing data before import | false |
+| `--verbose` | Enable verbose logging | false |
+
+### Stage 2: Training (`ahuvista-train`)
+
+Loads prepared data from database and trains the model:
+```bash
+cargo run --release --bin ahuvista-train -- \
+  --database ahuvista.db \
+  --epochs 50 \
+  --verbose
+```
+
+### Stage 3: Prediction (`ahuvista-predict`)
+
+Uses trained model for inference (unchanged from before).
 
 ### Directory Structure
 
-Place your CSV files in these directories:
+Place your CSV files in these directories before running `ahuvista-prepare`:
 
 ```
 datasets/
 ├── tabular/     # Patient demographics, lab results, risk assessments
 ├── temporal/    # Time-series measurements (vitals over time)
 ├── text/        # Clinical notes and reports
-├── image/       # Image metadata
-└── outcomes/    # Auto-generated if not present
+├── image/       # Medical images (PNG, JPG)
+└── outcomes/    # Outcome labels (auto-generated if not present)
+```
+
+### Benefits of Database-Backed Training
+
+- **Faster startup**: Data is pre-processed once, training starts immediately
+- **Consistent data**: Same normalized data across multiple training runs
+- **Scalability**: SQLite handles large datasets efficiently
+- **Reproducibility**: Database captures exact data state for each experiment
+- **Separation of concerns**: Data preparation is decoupled from training
 ```
 
 ### Supported Column Formats
@@ -366,12 +423,17 @@ cargo run --release --bin ahuvista-train -- \
 
 | Option | Short | Description | Example |
 |--------|-------|-------------|---------|
+| `--database` | | Path to prepared SQLite database | `--database ahuvista.db` |
 | `--config` | `-c` | Path to JSON config file | `--config config.json` |
 | `--modalities` | `-m` | Comma-separated modalities | `--modalities tabular,text` |
 | `--epochs` | `-e` | Number of training epochs | `--epochs 100` |
 | `--batch-size` | `-b` | Training batch size | `--batch-size 64` |
 | `--learning-rate` | `-l` | Learning rate | `--learning-rate 0.001` |
 | `--output-dir` | `-o` | Model output directory | `--output-dir ./models` |
+| `--no-privacy` | | Disable differential privacy | `--no-privacy` |
+| `--epsilon` | | Privacy epsilon value | `--epsilon 10.0` |
+| `--clip-norm` | | Gradient clipping norm | `--clip-norm 5.0` |
+| `--adaptive-lr` | | Enable adaptive learning rate | `--adaptive-lr` |
 | `--verbose` | `-v` | Enable verbose logging | `--verbose` |
 
 #### Examples
@@ -1335,17 +1397,45 @@ If using for research:
 
 ## 🚀 Quick Reference Card
 
+### Data Preparation
+
+```bash
+# Prepare all modalities
+cargo run --release --bin ahuvista-prepare -- \
+  --data-dir datasets \
+  --database ahuvista.db
+
+# Prepare specific modalities only
+cargo run --release --bin ahuvista-prepare -- \
+  --data-dir datasets \
+  --database ahuvista.db \
+  --modalities tabular,temporal
+
+# Clear and re-import
+cargo run --release --bin ahuvista-prepare -- \
+  --data-dir datasets \
+  --database ahuvista.db \
+  --clear \
+  --verbose
+```
+
 ### Training
 
 ```bash
-# Basic
-cargo run --release --bin ahuvista-train -- --modalities tabular --epochs 20
+# Basic (requires prepared database)
+cargo run --release --bin ahuvista-train -- \
+  --database ahuvista.db \
+  --modalities tabular \
+  --epochs 20
 
 # With config
-cargo run --release --bin ahuvista-train -- --config config.json
+cargo run --release --bin ahuvista-train -- \
+  --database ahuvista.db \
+  --config config.json
 
 # Full options
 cargo run --release --bin ahuvista-train -- \
+  --database ahuvista.db \
   --config config.json \
   --modalities tabular,temporal \
   --epochs 100 \
@@ -1388,8 +1478,19 @@ cargo run --release --bin ahuvista-predict -- \
 
 Combine with commas: `--modalities tabular,temporal,text`
 
+### Typical Workflow
+
+1. Prepare data (once, or when data changes)
+ahuvista-prepare --data-dir datasets --database ahuvista.db
+
+2. Train model (can run multiple times with different configs)
+ahuvista-train --database ahuvista.db --epochs 100 --output-dir models
+
+3. Make predictions
+ahuvista-predict --model models/model.bin --input patient.json
+
 ---
 
-**Version**: 2.0.0
+**Version**: 2.0.1
 **Last Updated**: 2025
 **Status**: Active Development

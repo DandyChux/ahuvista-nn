@@ -1,6 +1,6 @@
 [package]
 name = "ahuvista-nn"
-version = "0.1.1"
+version = "1.0.0"
 edition = "2024"
 description = "A multi-modal neural network focused on maternal health predictions"
 authors = ["Chukwuma Okoroji <dandychux@gmail.com>"]

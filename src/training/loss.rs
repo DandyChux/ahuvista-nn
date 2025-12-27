@@ -104,7 +104,7 @@ pub fn binary_accuracy(predictions: &[f32], targets: &[f32], threshold: f32) -> 
     let correct_count = predictions
         .iter()
         .zip(targets.iter())
-        .filter(|(&pred, &target)| {
+        .filter(|&(&pred, target)| {
             let pred_class = if pred >= threshold { 1.0 } else { 0.0 };
             (pred_class - target).abs() < 1e-6
         })

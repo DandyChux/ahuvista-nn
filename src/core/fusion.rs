@@ -297,7 +297,7 @@ impl LateFusionNet {
 
         // Process enabled modalities only
         if self.config.use_tabular {
-            if let (Some(ref mut net), Some(data)) = (&mut self.tabular_net, input.tabular) {
+            if let (Some(net), Some(data)) = (&mut self.tabular_net, input.tabular) {
                 let features = net.forward(data);
                 self.last_tabular_output = Some(features.clone());
                 feature_vectors.push(features);
@@ -305,7 +305,7 @@ impl LateFusionNet {
         }
 
         if self.config.use_temporal {
-            if let (Some(ref mut net), Some(data)) = (&mut self.temporal_net, input.temporal) {
+            if let (Some(net), Some(data)) = (&mut self.temporal_net, input.temporal) {
                 let features = net.forward(data);
                 self.last_temporal_output = Some(features.clone());
                 feature_vectors.push(features);
@@ -313,7 +313,7 @@ impl LateFusionNet {
         }
 
         if self.config.use_text {
-            if let (Some(ref mut net), Some(data)) = (&mut self.text_net, input.text) {
+            if let (Some(net), Some(data)) = (&mut self.text_net, input.text) {
                 let features = net.forward(data);
                 self.last_text_output = Some(features.clone());
                 feature_vectors.push(features);
@@ -321,7 +321,7 @@ impl LateFusionNet {
         }
 
         if self.config.use_image {
-            if let (Some(ref mut net), Some(data)) = (&mut self.image_net, input.image) {
+            if let (Some(net), Some(data)) = (&mut self.image_net, input.image) {
                 let features = net.forward(data);
                 self.last_image_output = Some(features.clone());
                 feature_vectors.push(features);

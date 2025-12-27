@@ -14,6 +14,8 @@ use std::path::Path;
 pub struct TabularData {
     /// The processed feature vectors
     pub data: Vec<Vec<f32>>,
+    /// Patient IDs corresponding to each data row
+    pub patient_ids: Vec<String>,
     /// Feature names
     pub feature_names: Vec<String>,
     /// Statistics for each numeric feature (mean, std_dev)
@@ -31,6 +33,7 @@ impl TabularData {
     pub fn new() -> Self {
         TabularData {
             data: Vec::new(),
+            patient_ids: Vec::new(),
             feature_names: Vec::new(),
             numeric_stats: HashMap::new(),
             categorical_mappings: HashMap::new(),
@@ -138,6 +141,7 @@ impl TabularData {
         // Process data
         let mut processed_data = TabularData {
             data: Vec::with_capacity(raw_data.len()),
+            patient_ids: Vec::with_capacity(raw_data.len()),
             feature_names: feature_names.clone(),
             numeric_stats: HashMap::new(),
             categorical_mappings: HashMap::new(),

@@ -1,14 +1,13 @@
-use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::{
     config::TrainingParams,
-    core::{fusion::LateFusionNet, Module, PrivacyEngine},
+    core::{Module, PrivacyEngine, fusion::LateFusionNet},
     data::{DataLoader, MultiModalBatch},
     training::{
-        balancing::{weighted_binary_cross_entropy, BayesianCalibrator},
+        balancing::{BayesianCalibrator, weighted_binary_cross_entropy},
         loss::binary_cross_entropy,
-        metrics::{calculate_auroc, ConfusionMatrix, EvaluationMetrics},
+        metrics::{ConfusionMatrix, EvaluationMetrics, calculate_auroc},
     },
 };
 
@@ -265,9 +264,14 @@ pub fn train_model_with_weights(
 
             info!(
                 "Epoch {}/{}: Train loss={:.4}, acc={:.2}%, auroc={:.4} | Val loss={:.4}, acc={:.2}%, auroc={:.4}",
-                epoch + 1, config.epochs,
-                train_metrics.loss, train_metrics.accuracy * 100.0, train_metrics.auroc,
-                val_metrics.loss, val_metrics.accuracy * 100.0, val_metrics.auroc
+                epoch + 1,
+                config.epochs,
+                train_metrics.loss,
+                train_metrics.accuracy * 100.0,
+                train_metrics.auroc,
+                val_metrics.loss,
+                val_metrics.accuracy * 100.0,
+                val_metrics.auroc
             );
 
             // Early stopping check

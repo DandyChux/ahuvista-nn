@@ -6,13 +6,6 @@
 //! 3. Train the model with population-informed class balancing
 //! 4. Evaluate performance with calibrated predictions
 //! 5. Make predictions on new data for maternal mortality risk
-mod audit;
-mod config;
-mod core;
-mod data;
-mod models;
-mod training;
-mod utils;
 
 use chrono::Utc;
 use clap::Parser;
@@ -21,7 +14,7 @@ use std::{collections::HashMap, fmt::Debug};
 use tracing::{error, info, warn};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
-use crate::{
+use ahuvista_nn::{
     audit::{AuditLogger, PredictionAuditRecord},
     config::{AppConfig, ModalityConfig, Settings, TrainingParams},
     core::fusion::{LateFusionNet, MultiModalInput},
@@ -177,7 +170,7 @@ fn main() -> AppResult<()> {
     info!("  Epochs: {}", settings.epochs);
     info!("  Batch size: {}", settings.batch_size);
     info!("  Learning rate: {}", settings.learning_rate);
-    info!("  Database: {:?}", settings.database);
+    info!("  Database: {:?}", args.database);
 
     // =========================================================
     // Step 1: LOAD DATA FROM DATABASE (instead of from files)
@@ -211,14 +204,14 @@ fn main() -> AppResult<()> {
     info!("  Outcomes:         {}", counts.outcomes);
 
     if counts.outcomes == 0 {
-        return Err(std::io::Error::new(
+        return Err(AppError::from(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "No data in database. Run 'ahuvista-prepare --data-dir datasets/' first.",
-        ));
+        )));
     }
 
     // Load tabular data if enabled
-    let tabular_data = if settings.modality_config.use_tabular && counts.tabular > 0 {
+    let mut tabular_data = if settings.modality_config.use_tabular && counts.tabular > 0 {
         let data = db.load_tabular_data().map_err(|e| {
             std::io::Error::new(
                 std::io::ErrorKind::Other,
@@ -240,7 +233,7 @@ fn main() -> AppResult<()> {
     };
 
     // Load temporal data if enabled
-    let temporal_data = if settings.modality_config.use_temporal && counts.temporal > 0 {
+    let mut temporal_data = if settings.modality_config.use_temporal && counts.temporal > 0 {
         let data = db.load_temporal_data().map_err(|e| {
             std::io::Error::new(
                 std::io::ErrorKind::Other,
@@ -255,13 +248,14 @@ fn main() -> AppResult<()> {
         Some(data)
     } else if settings.modality_config.use_temporal {
         warn!("  ✗ Temporal modality enabled but no data in database");
+        None
     } else {
         info!("  ✗ Temporal modality disabled, skipping");
         None
     };
 
     // Load text data if enabled
-    let text_data = if settings.modality_config.use_text && counts.text > 0 {
+    let mut text_data = if settings.modality_config.use_text && counts.text > 0 {
         let data = db.load_text_data().map_err(|e| {
             std::io::Error::new(
                 std::io::ErrorKind::Other,
@@ -276,13 +270,14 @@ fn main() -> AppResult<()> {
         Some(data)
     } else if settings.modality_config.use_text {
         warn!("  ✗ Text modality enabled but no data in database");
+        None
     } else {
         info!("  ✗ Text modality disabled, skipping");
         None
     };
 
     // Load image data if enabled
-    let image_data = if settings.modality_config.use_image && counts.image > 0 {
+    let mut image_data = if settings.modality_config.use_image && counts.image > 0 {
         let data = db.load_image_data().map_err(|e| {
             std::io::Error::new(
                 std::io::ErrorKind::Other,
@@ -298,6 +293,7 @@ fn main() -> AppResult<()> {
         Some(data)
     } else if settings.modality_config.use_image {
         warn!("  ✗ Image modality enabled but no data in database");
+        None
     } else {
         info!("  ✗ Image modality disabled, skipping");
         None
@@ -313,22 +309,45 @@ fn main() -> AppResult<()> {
     info!("  Loaded outcomes: {} patients", all_targets.len());
 
     // Determine the actual number of samples based on enabled modalities
-    let num_samples = if let Some(ref tab_data) = tabular_data {
-        tab_data.data.len()
-    } else if let Some(ref temp_data) = temporal_data {
-        temp_data.sequences.len()
-    } else if let Some(ref txt_data) = text_data {
-        txt_data.documents.len()
-    } else if let Some(ref img_data) = image_data {
-        img_data.images.len()
-    } else {
-        return Err(std::io::Error::new(
+    let mut sample_counts: Vec<usize> = vec![];
+    if let Some(ref mut tab_data) = tabular_data {
+        sample_counts.push(tab_data.data.len());
+    }
+    if let Some(ref mut temp_data) = temporal_data {
+        sample_counts.push(temp_data.sequences.len());
+    }
+    if let Some(ref mut txt_data) = text_data {
+        sample_counts.push(txt_data.documents.len());
+    }
+    if let Some(ref mut img_data) = image_data {
+        sample_counts.push(img_data.images.len());
+    }
+    let num_samples = if sample_counts.is_empty() {
+        return Err(AppError::from(std::io::Error::new(
             std::io::ErrorKind::Other,
             "No data loaded for any enabled modality",
-        ));
+        )));
+    } else {
+        *sample_counts.iter().min().unwrap()
     };
 
     // Truncate targets and causes to match the data size (assuming patient ordering is consistent across files)
+    // Truncate all modality data to ensure consistent sizes
+    if let Some(ref mut tab_data) = tabular_data {
+        tab_data.data.truncate(num_samples);
+        tab_data.patient_ids.truncate(num_samples);
+    }
+    if let Some(ref mut temp_data) = temporal_data {
+        temp_data.sequences.truncate(num_samples);
+    }
+    if let Some(ref mut txt_data) = text_data {
+        txt_data.documents.truncate(num_samples);
+        txt_data.token_sequences.truncate(num_samples);
+    }
+    if let Some(ref mut img_data) = image_data {
+        img_data.images.truncate(num_samples);
+    }
+
     let targets = all_targets
         .into_iter()
         .take(num_samples)

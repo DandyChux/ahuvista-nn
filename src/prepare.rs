@@ -5,25 +5,14 @@
 //! 2. Normalizing and preparing the data
 //! 3. Storing everything in the SQLite database for training
 
-mod config;
-mod data;
-mod utils;
-
 use clap::Parser;
 use std::path::PathBuf;
 use tracing::{error, info, warn};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
-use crate::{
-    config::Settings,
-    data::{
-        db::DatabaseManager,
-        loader::{
-            DataConfig, Normalizer, load_all_image_data, load_all_outcomes, load_all_tabular_data,
-            load_all_temporal_data, load_all_text_data,
-        },
-    },
-    utils::error::{AppError, AppResult},
+use ahuvista_nn::{
+    data::{db::DatabaseManager, loader::DataConfig},
+    utils::error::AppResult,
 };
 
 /// Command-line arguments for the data preparation program
@@ -103,11 +92,17 @@ fn main() -> AppResult<()> {
     // Track statistics
     let mut stats = PrepareStats::default();
 
-    // Load and store tabular data
-    info!("Loading tabular data from files...");
-    let tabular_data = load_all_tabular_data(&data_config)?;
+    // Import CSV files into relational tables (patients, patient_features)
+    info!("Importing patient data from CSV files...");
+    let tabular_dir = PathBuf::from(&args.data_dir).join("tabular");
+    let patient_count = db.import_csv_directory(&tabular_dir, &args.patient_id_column, None)?;
+    info!("  ✓ Imported {} patients", patient_count);
+
+    // Build TabularData from the database
+    info!("Building tabular features from database...");
+    let tabular_data = db.build_tabular_data()?;
     info!(
-        "  ✓ Loaded {} samples from CSV, {} features",
+        "  ✓ Built {} samples, {} features",
         tabular_data.data.len(),
         tabular_data.feature_dim()
     );
@@ -115,11 +110,13 @@ fn main() -> AppResult<()> {
     stats.tabular_features = tabular_data.feature_dim();
     db.store_tabular_data(&tabular_data)?;
 
-    // Load and store temporal data
-    info!("Loading temporal data...");
-    let temporal_data = load_all_temporal_data(&data_config)?;
+    // Build and store temporal data from database
+    let temporal_dir = PathBuf::from(&args.data_dir).join("temporal");
+    db.import_csv_directory(&temporal_dir, &args.patient_id_column, None)?;
+    info!("Building temporal data from database...");
+    let temporal_data = db.build_temporal_data()?;
     info!(
-        "  ✓ Loaded {} temporal sequences, {} features per timestep",
+        "  ✓ Built {} temporal sequences, {} features per timestep",
         temporal_data.sequences.len(),
         temporal_data.feature_dim()
     );
@@ -127,11 +124,13 @@ fn main() -> AppResult<()> {
     stats.temporal_features = temporal_data.feature_dim();
     db.store_temporal_data(&temporal_data)?;
 
-    // Load and store text data
-    info!("Loading text data...");
-    let text_data = load_all_text_data(&data_config)?;
+    // Build and store text data from database
+    let text_dir = PathBuf::from(&args.data_dir).join("text");
+    db.import_csv_directory(&text_dir, &args.patient_id_column, None)?;
+    info!("Building text data from database...");
+    let text_data = db.build_text_data(10000)?; // max 10k vocab
     info!(
-        "  ✓ Loaded {} documents, vocabulary size {}",
+        "  ✓ Built {} documents, vocabulary size {}",
         text_data.documents.len(),
         text_data.vocab_size()
     );
@@ -139,11 +138,13 @@ fn main() -> AppResult<()> {
     stats.vocab_size = text_data.vocab_size();
     db.store_text_data(&text_data)?;
 
-    // Load and store image data
-    info!("Loading image data...");
-    let image_data = load_all_image_data(&data_config)?;
+    // Build and store image data from files
+    let image_dir = PathBuf::from(&args.data_dir).join("image");
+    db.import_csv_directory(&image_dir, &args.patient_id_column, None)?;
+    info!("Building image data from files...");
+    let image_data = db.build_image_data(&image_dir, (224, 224), false)?;
     info!(
-        "  ✓ Loaded {} images, size {}x{}",
+        "  ✓ Built {} images, size {}x{}",
         image_data.images.len(),
         image_data.image_size.0,
         image_data.image_size.1
@@ -153,9 +154,9 @@ fn main() -> AppResult<()> {
     db.store_image_data(&image_data)?;
 
     // Load and store outcomes
-    info!("Loading outcomes...");
-    let (targets, causes) = load_all_outcomes(&data_config)?;
-    info!("  ✓ Loaded {} outcomes", targets.len());
+    info!("Building outcomes from database...");
+    let (targets, causes) = db.build_outcomes()?;
+    info!("  ✓ Built {} outcomes", targets.len());
     stats.outcomes = targets.len();
     db.store_outcomes(&targets, &causes)?;
 

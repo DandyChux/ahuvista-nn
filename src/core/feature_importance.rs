@@ -1,6 +1,6 @@
 use super::Module;
-use crate::data::MultiModalBatch; // or your data structures
-use crate::training::metrics::{evalute_auroc, EvaluationMetrics};
+use crate::data::MultiModalBatch;
+use crate::training::metrics::{EvaluationMetrics, evalute_auroc};
 use rand::rng;
 use rand::seq::SliceRandom;
 use std::collections::HashMap;

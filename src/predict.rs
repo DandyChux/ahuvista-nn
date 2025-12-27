@@ -5,15 +5,10 @@
 //!
 //! Supports modular models with selective modality processing.
 
-mod config;
-mod core;
-mod training;
-mod utils;
-
-use crate::config::{ModalityConfig, Settings};
-use crate::core::fusion::{LateFusionNet, MultiModalInput};
-use crate::training::balancing::BayesianCalibrator;
-use crate::utils::error::AppResult;
+use ahuvista_nn::config::{ModalityConfig, Settings};
+use ahuvista_nn::core::fusion::{LateFusionNet, MultiModalInput};
+use ahuvista_nn::training::balancing::BayesianCalibrator;
+use ahuvista_nn::utils::error::AppResult;
 use clap::Parser;
 use ndarray::Array3;
 use serde::{Deserialize, Serialize};

@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use tracing::info;
+use tracing::{debug, info};
 
 use super::{ImageData, TabularData, TemporalData, TextData};
 use crate::data::db::DatabaseManager;
@@ -107,6 +107,7 @@ pub struct PatientData {
     pub pregnancies: Option<u32>,
     pub risk_level: Option<String>,
     pub existing_outcome: Option<f32>,
+    pub cause_code: Option<u32>,
     pub extra_features: HashMap<String, f32>,
     pub temporal_measurements: Vec<TemporalMeasurement>,
     pub clinical_notes: Vec<String>,
@@ -117,7 +118,23 @@ pub struct PatientData {
 }
 
 impl PatientData {
-    pub fn to_raw_features(&self) -> Vec<f32> {
+    /// Convert patient data to a feature vector.
+    /// If extra_keys is provided, uses those keys in order (with 0.0 for missing features).
+    /// Otherwise, uses this patient's extra features sorted alphabetically.
+    pub fn to_raw_features(&self, extra_keys: Option<&[String]>) -> Vec<f32> {
+        let owned_keys: Vec<String>;
+        let keys = match extra_keys {
+            Some(keys) => keys,
+            None => {
+                owned_keys = {
+                    let mut keys: Vec<_> = self.extra_features.keys().cloned().collect();
+                    keys.sort();
+                    keys
+                };
+                &owned_keys
+            }
+        };
+
         let mut features = vec![
             self.age.unwrap_or(0.0),
             self.systolic_bp.or(self.blood_pressure).unwrap_or(0.0),
@@ -129,10 +146,10 @@ impl PatientData {
             self.risk_score,
         ];
 
-        let mut extra_keys: Vec<_> = self.extra_features.keys().collect();
-        extra_keys.sort();
-        for key in extra_keys {
-            features.push(self.extra_features[key]);
+        // Add extra features in the order specified by keys
+        // Use 0.0 for missing features
+        for key in keys {
+            features.push(*self.extra_features.get(key).unwrap_or(&0.0));
         }
 
         features
@@ -210,6 +227,8 @@ pub struct DataPreparer {
     patient_database: HashMap<String, PatientData>,
     /// Cached normalizer (built after all data is loaded)
     normalizer: Option<Normalizer>,
+    /// Counter for generating unique patient IDs
+    id_counter: usize,
 }
 
 impl DataPreparer {
@@ -217,7 +236,14 @@ impl DataPreparer {
         Self {
             patient_database: HashMap::new(),
             normalizer: None,
+            id_counter: 0,
         }
+    }
+
+    /// Generate a unique patient ID when one is not provided in the data
+    pub fn generate_patient_id(&mut self) -> String {
+        self.id_counter += 1;
+        format!("P{:02}", self.id_counter)
     }
 
     /// Add or merge a patient record into the in-memory database
@@ -344,7 +370,9 @@ impl MultiModalDataLoader {
         image_data: ImageData,
         targets: Vec<f32>,
     ) -> Self {
+        debug!("Target length: {}", targets.len());
         if !tabular_data.data.is_empty() {
+            debug!("Tabular data has {} rows", tabular_data.data.len());
             assert_eq!(
                 tabular_data.data.len(),
                 targets.len(),
@@ -355,6 +383,10 @@ impl MultiModalDataLoader {
         }
 
         if !temporal_data.sequences.is_empty() {
+            debug!(
+                "Temporal data has {} sequences",
+                temporal_data.sequences.len()
+            );
             assert_eq!(
                 temporal_data.sequences.len(),
                 targets.len(),
@@ -521,7 +553,7 @@ pub fn prepare_all_data(data_dir: &Path) -> AppResult<()> {
     Ok(())
 }
 
-fn generate_outcomes(data_dir: &Path, output_path: &Path) -> AppResult<()> {
+pub fn generate_outcomes(data_dir: &Path, output_path: &Path) -> AppResult<()> {
     use csv::Writer;
     use rand::Rng;
 
@@ -547,7 +579,7 @@ fn generate_outcomes(data_dir: &Path, output_path: &Path) -> AppResult<()> {
 
     let mut rng = rand::rng();
     for i in 0..patient_count {
-        let patient_id = format!("patient_{}", i);
+        let patient_id = format!("P{:02}", i);
         let mortality = if rng.random::<f32>() < 0.1 { 1 } else { 0 };
         let cause_code = if mortality == 1 {
             rng.random_range(0..5)
@@ -847,19 +879,17 @@ fn merge_tabular_files(files: &[PathBuf], config: &DataConfig) -> AppResult<Tabu
         let headers: Vec<String> = reader.headers()?.iter().map(|s| s.to_string()).collect();
 
         // Find patient ID column
-        let id_col_idx = headers
-            .iter()
-            .position(|h| h.eq_ignore_ascii_case(&config.patient_id_column))
-            .ok_or_else(|| {
-                AppError::DataError(format!(
-                    "Patient ID column '{}' not found",
-                    config.patient_id_column
-                ))
-            })?;
+        let id_col_idx = headers.iter().position(|h| {
+            let h_lower = h.to_lowercase();
+            h_lower.contains("patient")
+                || h_lower.contains("subject")
+                || h_lower == "id"
+                || h.eq_ignore_ascii_case(&config.patient_id_column)
+        });
 
         // Track feature names
         for (i, name) in headers.iter().enumerate() {
-            if i != id_col_idx && !feature_name_set.contains(name) {
+            if Some(i) != id_col_idx && !feature_name_set.contains(name) {
                 feature_name_set.insert(name.clone());
                 all_feature_names.push(name.clone());
             }
@@ -868,11 +898,16 @@ fn merge_tabular_files(files: &[PathBuf], config: &DataConfig) -> AppResult<Tabu
         // Process records
         for result in reader.records() {
             let record = result?;
-            let patient_id = record.get(id_col_idx).unwrap_or("").trim().to_string();
-
-            if patient_id.is_empty() {
-                continue;
-            }
+            let patient_id = if let Some(idx) = id_col_idx {
+                let id = record.get(idx).unwrap_or("").trim().to_string();
+                if id.is_empty() {
+                    preparer.generate_patient_id()
+                } else {
+                    id
+                }
+            } else {
+                preparer.generate_patient_id()
+            };
 
             let mut patient = PatientData {
                 patient_id: patient_id.clone(),
@@ -881,7 +916,7 @@ fn merge_tabular_files(files: &[PathBuf], config: &DataConfig) -> AppResult<Tabu
 
             // Map columns to PatientData fields
             for (i, value) in record.iter().enumerate() {
-                if i == id_col_idx || value.trim().is_empty() {
+                if Some(i) == id_col_idx || value.trim().is_empty() {
                     continue;
                 }
 
@@ -917,21 +952,53 @@ fn merge_tabular_files(files: &[PathBuf], config: &DataConfig) -> AppResult<Tabu
     );
 
     // Convert to TabularData
-    let mut data: Vec<Vec<f32>> = Vec::new();
     let patient_ids = preparer.get_all_patient_ids();
+    let mut all_extra_keys: HashSet<String> = HashSet::new();
 
     for patient_id in &patient_ids {
         if let Some(patient) = preparer.get_patient(patient_id) {
-            data.push(patient.to_raw_features());
+            for key in patient.extra_features.keys() {
+                all_extra_keys.insert(key.clone());
+            }
         }
     }
+
+    // Sort the keys for consistent ordering
+    let mut sorted_extra_keys: Vec<String> = all_extra_keys.into_iter().collect();
+    sorted_extra_keys.sort();
+
+    info!("Total extra feature columns: {}", sorted_extra_keys.len());
+
+    // Now convert all patients using the same set of keys
+    let mut data: Vec<Vec<f32>> = Vec::new();
+    for patient_id in &patient_ids {
+        if let Some(patient) = preparer.get_patient(patient_id) {
+            data.push(patient.to_raw_features(Some(&sorted_extra_keys)));
+        }
+    }
+
+    // Build complete feature names list
+    let base_feature_names = vec![
+        "age".to_string(),
+        "systolic_bp".to_string(),
+        "diastolic_bp".to_string(),
+        "glucose".to_string(),
+        "bmi".to_string(),
+        "pregnancies".to_string(),
+        "has_complications".to_string(),
+        "risk_score".to_string(),
+    ];
+
+    let mut complete_feature_names = base_feature_names;
+    complete_feature_names.extend(sorted_extra_keys);
 
     // Normalize features
     normalize_features(&mut data);
 
     Ok(TabularData {
         data,
-        feature_names: all_feature_names,
+        patient_ids,
+        feature_names: complete_feature_names,
         numeric_stats: HashMap::new(),
         categorical_mappings: HashMap::new(),
         categorical_features: Vec::new(),
@@ -957,16 +1024,13 @@ fn merge_temporal_files(files: &[PathBuf], config: &DataConfig) -> AppResult<Tem
         let headers: Vec<String> = reader.headers()?.iter().map(|s| s.to_string()).collect();
 
         // Find patient ID and timestamp columns
-        let id_col_idx = headers
-            .iter()
-            .position(|h| h.eq_ignore_ascii_case(&config.patient_id_column))
-            .ok_or_else(|| {
-                AppError::DataError(format!(
-                    "Patient ID column '{}' not found in {}",
-                    config.patient_id_column,
-                    file.display()
-                ))
-            })?;
+        let id_col_idx = headers.iter().position(|h| {
+            let h_lower = h.to_lowercase();
+            h_lower.contains("patient")
+                || h_lower.contains("subject")
+                || h_lower == "id"
+                || h.eq_ignore_ascii_case(&config.patient_id_column)
+        });
 
         let timestamp_col_idx = headers
             .iter()
@@ -974,7 +1038,7 @@ fn merge_temporal_files(files: &[PathBuf], config: &DataConfig) -> AppResult<Tem
 
         // Collect measurement type columns (all columns except ID and timestamp)
         for (i, name) in headers.iter().enumerate() {
-            if i != id_col_idx && timestamp_col_idx.map_or(true, |t| i != t) {
+            if Some(i) != id_col_idx && timestamp_col_idx.map_or(true, |t| i != t) {
                 all_measurement_types.insert(name.clone());
             }
         }
@@ -982,11 +1046,16 @@ fn merge_temporal_files(files: &[PathBuf], config: &DataConfig) -> AppResult<Tem
         // Process records
         for result in reader.records() {
             let record = result?;
-            let patient_id = record.get(id_col_idx).unwrap_or("").trim().to_string();
-
-            if patient_id.is_empty() {
-                continue;
-            }
+            let patient_id = if let Some(idx) = id_col_idx {
+                let id = record.get(idx).unwrap_or("").trim().to_string();
+                if id.is_empty() {
+                    preparer.generate_patient_id()
+                } else {
+                    id
+                }
+            } else {
+                preparer.generate_patient_id()
+            };
 
             let timestamp = timestamp_col_idx
                 .and_then(|idx| record.get(idx))
@@ -996,7 +1065,7 @@ fn merge_temporal_files(files: &[PathBuf], config: &DataConfig) -> AppResult<Tem
             // Create temporal measurements for this row
             let mut measurements = Vec::new();
             for (i, value) in record.iter().enumerate() {
-                if i == id_col_idx || timestamp_col_idx.map_or(false, |t| i == t) {
+                if Some(i) == id_col_idx || timestamp_col_idx.map_or(false, |t| i == t) {
                     continue;
                 }
 
@@ -1374,6 +1443,7 @@ pub fn create_data_loader(
     // Create data containers
     let tabular_container = TabularData {
         data: tabular_data,
+        patient_ids: Vec::new(),
         feature_names: Vec::new(),
         numeric_stats: HashMap::new(),
         categorical_mappings: HashMap::new(),
@@ -1416,7 +1486,7 @@ pub fn create_data_loader(
     )
 }
 
-fn normalize_features(data: &mut Vec<Vec<f32>>) {
+pub fn normalize_features(data: &mut Vec<Vec<f32>>) {
     if data.is_empty() {
         return;
     }

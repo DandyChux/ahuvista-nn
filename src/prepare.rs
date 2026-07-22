@@ -60,7 +60,7 @@ fn main() -> AppResult<()> {
             .init();
     } else {
         tracing_subscriber::registry()
-            .with(fmt::layer().json())
+            .with(fmt::layer().compact())
             .init();
     }
 
@@ -98,6 +98,22 @@ fn main() -> AppResult<()> {
     let patient_count = db.import_csv_directory(&tabular_dir, &args.patient_id_column, None)?;
     info!("  ✓ Imported {} patients", patient_count);
 
+    // Import temporal data
+    let temporal_dir = PathBuf::from(&args.data_dir).join("temporal");
+    db.import_csv_directory(&temporal_dir, &args.patient_id_column, None)?;
+
+    // Import text data
+    let text_dir = PathBuf::from(&args.data_dir).join("text");
+    db.import_csv_directory(&text_dir, &args.patient_id_column, None)?;
+
+    // Import image data
+    let image_dir = PathBuf::from(&args.data_dir).join("image");
+    db.import_csv_directory(&image_dir, &args.patient_id_column, None)?;
+
+    info!("Cleaning up non-maternal records...");
+    let removed = db.cleanup_non_maternal_patients()?;
+    info!("  ✓ Removed {} non-pregnant patients", removed);
+
     // Build TabularData from the database
     info!("Building tabular features from database...");
     let tabular_data = db.build_tabular_data()?;
@@ -111,8 +127,6 @@ fn main() -> AppResult<()> {
     db.store_tabular_data(&tabular_data)?;
 
     // Build and store temporal data from database
-    let temporal_dir = PathBuf::from(&args.data_dir).join("temporal");
-    db.import_csv_directory(&temporal_dir, &args.patient_id_column, None)?;
     info!("Building temporal data from database...");
     let temporal_data = db.build_temporal_data()?;
     info!(
@@ -125,8 +139,6 @@ fn main() -> AppResult<()> {
     db.store_temporal_data(&temporal_data)?;
 
     // Build and store text data from database
-    let text_dir = PathBuf::from(&args.data_dir).join("text");
-    db.import_csv_directory(&text_dir, &args.patient_id_column, None)?;
     info!("Building text data from database...");
     let text_data = db.build_text_data(10000)?; // max 10k vocab
     info!(
@@ -139,8 +151,6 @@ fn main() -> AppResult<()> {
     db.store_text_data(&text_data)?;
 
     // Build and store image data from files
-    let image_dir = PathBuf::from(&args.data_dir).join("image");
-    db.import_csv_directory(&image_dir, &args.patient_id_column, None)?;
     info!("Building image data from files...");
     let image_data = db.build_image_data(&image_dir, (224, 224), false)?;
     info!(

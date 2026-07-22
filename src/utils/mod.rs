@@ -24,10 +24,14 @@ pub fn relu(x: f32) -> f32 {
     x.max(0.0)
 }
 
+pub fn leaky_relu(x: f32) -> f32 {
+    x.max(0.1 * x)
+}
+
 pub fn relu_derivative(relu_x: f32) -> f32 {
-    if relu_x > 0.0 {
-        1.0
-    } else {
-        0.0
-    }
+    if relu_x > 0.0 { 1.0 } else { 0.0 }
+}
+
+pub fn leaky_relu_derivative(leaky_relu_x: f32) -> f32 {
+    if leaky_relu_x > 0.0 { 1.0 } else { 0.1 }
 }

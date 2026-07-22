@@ -6,6 +6,7 @@
 //! Supports modular models with selective modality processing.
 
 use ahuvista_nn::config::{ModalityConfig, Settings};
+use ahuvista_nn::core::PredictionInput;
 use ahuvista_nn::core::fusion::{LateFusionNet, MultiModalInput};
 use ahuvista_nn::training::balancing::BayesianCalibrator;
 use ahuvista_nn::utils::error::AppResult;
@@ -54,55 +55,6 @@ struct Args {
     /// Batch prediction mode: input is a directory of JSON files
     #[arg(short, long)]
     batch: bool,
-}
-
-/// Input data structure for predictions
-#[derive(Debug, Deserialize)]
-struct PredictionInput {
-    /// Tabular features (optional if modality not enabled)
-    #[serde(default)]
-    tabular: Option<Vec<f32>>,
-
-    /// Temporal sequence data (optional if modality not enabled)
-    #[serde(default)]
-    temporal: Option<Vec<Vec<f32>>>,
-
-    /// Text data as raw string (optional if modality not enabled)
-    #[serde(default)]
-    text: Option<String>,
-
-    /// Path to image file (optional if modality not enabled)
-    #[serde(default)]
-    image_path: Option<String>,
-
-    /// Optional patient identifier (for logging/tracking)
-    #[serde(default)]
-    patient_id: Option<String>,
-}
-
-/// Output data structure for predictions
-#[derive(Debug, Serialize)]
-struct PredictionOutput {
-    /// Raw model output score (0-1)
-    risk_score: f32,
-
-    /// Calibrated risk score if calibration was applied
-    calibrated_score: Option<f32>,
-
-    /// Risk category (MINIMAL, LOW, MODERATE, HIGH, CRITICAL)
-    risk_category: String,
-
-    /// Confidence in the prediction
-    confidence: f32,
-
-    /// Which modalities were used for this prediction
-    modalities_used: Vec<String>,
-
-    /// Optional patient identifier
-    patient_id: Option<String>,
-
-    /// Timestamp of prediction
-    timestamp: String,
 }
 
 /// Metadata about the model (saved alongside model weights)

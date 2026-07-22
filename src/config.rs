@@ -11,21 +11,7 @@ pub struct Settings {
     pub patient_id_column: String,
 
     // Training settings
-    pub epochs: usize,
-    pub batch_size: usize,
-    pub learning_rate: f32,
-
-    // Privacy settings
-    pub use_privacy: bool,
-    pub privacy_epsilon: f32,
-    pub privacy_delta: f32,
-    pub gradient_clip_norm: f32,
-
-    // Adaptive learning rate settings
-    pub use_adaptive_lr: bool,
-    pub lr_decay_rate: f32,
-    pub lr_decay_steps: usize,
-    pub min_learning_rate: f32,
+    pub training: TrainingParams,
 
     // Model settings
     pub tabular_hidden_sizes: Vec<usize>,
@@ -50,22 +36,7 @@ impl Default for Settings {
         Self {
             data_dir: PathBuf::from("datasets"),
             patient_id_column: String::from("PatientID"),
-            epochs: 50,
-            batch_size: 32,
-            learning_rate: 0.01,
-
-            // Privacy settings
-            use_privacy: false, // Disabled by default for debugging
-            privacy_epsilon: 10.0,
-            privacy_delta: 1e-5,
-            gradient_clip_norm: 5.0,
-
-            // Adaptive LR settings
-            use_adaptive_lr: true,
-            lr_decay_rate: 0.95,
-            lr_decay_steps: 100,
-            min_learning_rate: 0.001,
-
+            training: TrainingParams::default(),
             tabular_hidden_sizes: vec![128, 64],
             temporal_hidden_size: 128,
             text_embedding_dim: 128,
@@ -189,6 +160,8 @@ pub struct TrainingParams {
     pub batch_size: usize,
     pub learning_rate: f32,
     pub val_frequency: usize,
+    #[serde(default = "default_weight_decay")]
+    pub weight_decay: f32,
 
     // Privacy settings
     #[serde(default = "default_use_privacy")]
@@ -205,8 +178,8 @@ pub struct TrainingParams {
     pub use_adaptive_lr: bool,
     #[serde(default = "default_lr_decay_rate")]
     pub lr_decay_rate: f32,
-    #[serde(default = "default_lr_decay_steps")]
-    pub lr_decay_steps: usize,
+    #[serde(default = "default_lr_decay_epochs", alias = "lr_decay_steps")]
+    pub lr_decay_epochs: usize,
     #[serde(default = "default_min_learning_rate")]
     pub min_learning_rate: f32,
 }
@@ -215,17 +188,18 @@ impl Default for TrainingParams {
     fn default() -> Self {
         Self {
             epochs: 20,
-            batch_size: 32,
-            learning_rate: 0.001,
+            batch_size: 256,
+            learning_rate: 0.005,
             val_frequency: 1,
+            weight_decay: 0.001,
             use_privacy: false,
             privacy_epsilon: 10.0,
             privacy_delta: 1e-5,
-            gradient_clip_norm: 1.0,
-            use_adaptive_lr: true,
+            gradient_clip_norm: 5.0,
+            use_adaptive_lr: false,
             lr_decay_rate: 0.95,
-            lr_decay_steps: 100,
-            min_learning_rate: 0.001,
+            lr_decay_epochs: 5,
+            min_learning_rate: 0.0001,
         }
     }
 }
@@ -289,17 +263,7 @@ impl From<AppConfig> for Settings {
         Settings {
             data_dir: PathBuf::from(config.data_paths.data_dir),
             patient_id_column: config.data_paths.patient_id_column,
-            epochs: config.training.epochs,
-            batch_size: config.training.batch_size,
-            learning_rate: config.training.learning_rate,
-            use_privacy: config.training.use_privacy,
-            privacy_epsilon: config.training.privacy_epsilon,
-            privacy_delta: config.training.privacy_delta,
-            gradient_clip_norm: config.training.gradient_clip_norm,
-            use_adaptive_lr: config.training.use_adaptive_lr,
-            lr_decay_rate: config.training.lr_decay_rate,
-            lr_decay_steps: config.training.lr_decay_steps,
-            min_learning_rate: config.training.min_learning_rate,
+            training: config.training, // Just move it directly!
             tabular_hidden_sizes: config.model.tabular_hidden_sizes,
             temporal_hidden_size: config.model.temporal_hidden_size,
             text_embedding_dim: config.model.text_embedding_dim,
@@ -319,19 +283,22 @@ fn default_privacy_delta() -> f32 {
     1e-5
 }
 fn default_gradient_clip_norm() -> f32 {
-    1.0
+    5.0
 }
 fn default_use_adaptive_lr() -> bool {
     true
 }
 fn default_lr_decay_rate() -> f32 {
-    0.95
+    0.5
 }
-fn default_lr_decay_steps() -> usize {
-    100
+fn default_lr_decay_epochs() -> usize {
+    5
 }
 fn default_min_learning_rate() -> f32 {
     0.0001
+}
+fn default_weight_decay() -> f32 {
+    0.01
 }
 
 // pub static SETTINGS: LazyLock<Settings> = LazyLock::new(|| Settings::default());

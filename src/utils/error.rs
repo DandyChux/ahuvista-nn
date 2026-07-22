@@ -12,6 +12,8 @@ pub enum AppError {
     DomainError(String),
     ImageError(image::ImageError),
     SqliteError(rusqlite::Error),
+    #[cfg(feature = "fhir")]
+    FhirError(crate::data::FhirError),
 }
 
 impl Display for AppError {
@@ -26,6 +28,8 @@ impl Display for AppError {
             AppError::DomainError(msg) => write!(f, "Domain error: {}", msg),
             AppError::ImageError(msg) => write!(f, "Image processing error: {}", msg),
             AppError::SqliteError(msg) => write!(f, "SQLite error: {}", msg),
+            #[cfg(feature = "fhir")]
+            AppError::FhirError(err) => write!(f, "FHIR error: {}", err),
         }
     }
 }
@@ -62,6 +66,8 @@ macro_rules! impl_from_error {
     };
 }
 
+impl std::error::Error for AppError {}
+
 impl_from_error!(std::io::Error, Io);
 impl_from_error!(csv::Error, CsvError);
 impl_from_error!(serde_json::Error, JsonError);
@@ -69,13 +75,8 @@ impl_from_error!(String, DomainError);
 impl_from_error!(image::ImageError, ImageError);
 impl_from_error!(std::string::FromUtf8Error => DomainError as String);
 impl_from_error!(rusqlite::Error, SqliteError);
-
-impl std::error::Error for AppError {}
-
-impl From<&str> for AppError {
-    fn from(err: &str) -> Self {
-        AppError::DomainError(err.to_string())
-    }
-}
+#[cfg(feature = "fhir")]
+impl_from_error!(crate::data::FhirError, FhirError);
+impl_from_error!(&str => DomainError as String);
 
 pub type AppResult<T, E = AppError> = Result<T, E>;

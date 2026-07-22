@@ -51,7 +51,8 @@ impl DatabaseManager {
         conn.execute_batch(
             "PRAGMA foreign_keys = ON;
             PRAGMA journal_mode = WAL;
-            PRAGMA synchronous = NORMAL;",
+            PRAGMA synchronous = NORMAL;
+            PRAGMA cache_size = -64000;",
         )?;
 
         let mut db = Self { conn };
@@ -77,6 +78,8 @@ impl DatabaseManager {
             "CREATE TABLE IF NOT EXISTS patients (
                     patient_id TEXT PRIMARY KEY,
                     age REAL,
+                    race TEXT,
+                    insurance TEXT,
                     blood_pressure REAL,
                     systolic_bp REAL,
                     diastolic_bp REAL,
@@ -106,6 +109,10 @@ impl DatabaseManager {
                 )",
             [],
         )?;
+        tx.execute(
+            "CREATE INDEX IF NOT EXISTS idx_patient_features ON patient_features(patient_id);",
+            [],
+        )?;
 
         // 3. Temporal Measurements
         tx.execute(
@@ -133,6 +140,10 @@ impl DatabaseManager {
                     content TEXT,
                     FOREIGN KEY(patient_id) REFERENCES patients(patient_id) ON DELETE CASCADE
                 )",
+            [],
+        )?;
+        tx.execute(
+            "CREATE INDEX IF NOT EXISTS idx_clinical_notes ON clinical_notes(patient_id);",
             [],
         )?;
 
@@ -377,6 +388,29 @@ impl DatabaseManager {
             .prepare("SELECT DISTINCT feature_name FROM patient_features ORDER BY feature_name")?
             .query_map([], |row| row.get(0))?
             .filter_map(|r| r.ok())
+            .collect();
+
+        // Filter out non-clinical features that should not be model inputs
+        let blacklisted: HashSet<&str> = [
+            "hadm_id",
+            "anchor_year",
+            "anchor_year_group",
+            "dod",
+            "subject_id",
+            "row_id",
+            "admittime",
+            "dischtime",
+            "deathtime",
+            "edregtime",
+            "edouttime",
+        ]
+        .iter()
+        .cloned()
+        .collect();
+
+        let extra_feature_names: Vec<String> = extra_feature_names
+            .into_iter()
+            .filter(|name| !blacklisted.contains(name.to_lowercase().replace(" ", "_").as_str()))
             .collect();
 
         // Build feature names list
@@ -1385,10 +1419,7 @@ impl DatabaseManager {
 
         let timestamp_col_idx = headers.iter().position(|h| {
             let h_lower = h.to_lowercase();
-            h_lower.contains("timestamp")
-                || h_lower.contains("time")
-                || h_lower.contains("date")
-                || h_lower.contains("datetime")
+            h_lower.contains("timestamp") || h_lower.contains("datetime")
         });
 
         let note_col_idx = headers.iter().position(|h| {
@@ -1410,6 +1441,9 @@ impl DatabaseManager {
         // Known column mappings (case-insensitive)
         let known_columns: HashMap<&str, &str> = [
             ("age", "age"),
+            ("anchor_age", "age"),
+            ("race", "race"),
+            ("insurance", "insurance"),
             ("bloodpressure", "blood_pressure"),
             ("bp", "blood_pressure"),
             ("systolicbp", "systolic_bp"),
@@ -1427,9 +1461,31 @@ impl DatabaseManager {
             ("risk_level", "risk_level"),
             ("outcome", "existing_outcome"),
             ("mortality", "existing_outcome"),
+            ("hospital_expire_flag", "existing_outcome"),
             ("causecode", "cause_code"),
             ("cause_code", "cause_code"),
             ("cause", "cause_code"),
+        ]
+        .iter()
+        .cloned()
+        .collect();
+
+        // Columns that should NEVER be used as model features.
+        // These are identifiers, administrative data, or target-leaking fields.
+        let feature_blacklist: HashSet<&str> = [
+            "hadm_id",              // Hospital admission ID — pure identifier
+            "anchor_year",          // MIMIC shifted calendar year — not clinical
+            "anchor_year_group",    // MIMIC year group — not clinical
+            "dod",                  // Date of death — target leakage!
+            "subject_id",           // Patient ID duplicate
+            "row_id",               // Database row ID
+            "admittime",            // Administrative timestamp
+            "dischtime",            // Administrative timestamp
+            "deathtime",            // Target leakage!
+            "edregtime",            // ED registration time
+            "edouttime",            // ED out time
+            "hospital_expire_flag", // Already mapped as known column
+            "expire_flag",          // Target leakage
         ]
         .iter()
         .cloned()
@@ -1451,12 +1507,47 @@ impl DatabaseManager {
             Vec::new()
         };
 
+        // ---------------------------------------------------------
+        // PRE-COMPUTE COLUMN ACTIONS (Do this ONCE per file)
+        // ---------------------------------------------------------
+        enum ColAction {
+            Skip,
+            Gender,
+            Known(&'static str),
+            Extra(String),
+        }
+
+        let mut col_actions: Vec<ColAction> = Vec::with_capacity(headers.len());
+
+        for (i, col_name) in headers.iter().enumerate() {
+            if Some(i) == id_col_idx {
+                col_actions.push(ColAction::Skip);
+                continue;
+            }
+
+            let col_lower = col_name.to_lowercase().replace(" ", "_");
+
+            if col_lower == "gender" || col_lower == "sex" {
+                col_actions.push(ColAction::Gender);
+            } else if let Some(&field_name) = known_columns.get(col_lower.as_str()) {
+                col_actions.push(ColAction::Known(field_name));
+            } else if feature_blacklist.contains(col_lower.as_str()) {
+                col_actions.push(ColAction::Skip);
+            } else {
+                col_actions.push(ColAction::Extra(col_name.clone()));
+            }
+        }
+
+        // ---------------------------------------------------------
+        // FAST ROW PROCESSING
+        // ---------------------------------------------------------
         const BATCH_SIZE: usize = 10_000;
         let mut batch: Vec<PatientData> = Vec::with_capacity(BATCH_SIZE);
         let mut total_count: usize = 0;
 
         for result in reader.records() {
             let record = result?;
+            let mut skip_patient = false;
 
             let patient_id = match id_col_idx {
                 Some(idx) => {
@@ -1470,7 +1561,6 @@ impl DatabaseManager {
                 None => preparer.generate_patient_id(),
             };
 
-            // Build patient data from CSV row
             let mut patient = PatientData {
                 patient_id: patient_id.clone(),
                 ..Default::default()
@@ -1498,7 +1588,6 @@ impl DatabaseManager {
                     if let Some(content) = record.get(text_idx) {
                         let content = content.trim();
                         if !content.is_empty() {
-                            // Optionally prepend note type
                             let note = if let Some(type_idx) = note_type_col_idx {
                                 let note_type = record.get(type_idx).unwrap_or("").trim();
                                 if !note_type.is_empty() {
@@ -1515,44 +1604,86 @@ impl DatabaseManager {
                 }
             } else {
                 for (i, value) in record.iter().enumerate() {
-                    if Some(i) == id_col_idx || value.trim().is_empty() {
+                    let v_str = value.trim();
+                    if v_str.is_empty() {
                         continue;
                     }
 
-                    let col_name = &headers[i];
-                    let col_lower = col_name.to_lowercase().replace(" ", "_");
-
-                    if let Some(&field_name) = known_columns.get(col_lower.as_str()) {
-                        // Parse and assign to known field
-                        if let Ok(v) = value.trim().parse::<f32>() {
-                            match field_name {
-                                "age" => patient.age = Some(v),
-                                "blood_pressure" => patient.blood_pressure = Some(v),
-                                "systolic_bp" => patient.systolic_bp = Some(v),
-                                "diastolic_bp" => patient.diastolic_bp = Some(v),
-                                "glucose" => patient.glucose = Some(v),
-                                "bmi" => patient.bmi = Some(v),
-                                "pregnancies" => patient.pregnancies = Some(v as u32),
-                                "existing_outcome" => patient.existing_outcome = Some(v),
-                                "cause_code" => patient.cause_code = Some(v as u32),
-                                _ => {}
+                    match &col_actions[i] {
+                        ColAction::Skip => continue,
+                        ColAction::Gender => {
+                            let v_lower = v_str.to_lowercase();
+                            if v_lower == "male" || v_lower == "m" {
+                                skip_patient = true;
+                                break;
                             }
-                        } else if field_name == "risk_level" {
-                            patient.risk_level = Some(value.trim().to_string());
                         }
-                    } else {
-                        // Try to parse as numeric and store as extra feature
-                        if let Ok(v) = value.trim().parse::<f32>() {
-                            patient.extra_features.insert(col_name.clone(), v);
+                        ColAction::Known(field_name) => match *field_name {
+                            "race" => patient.race = Some(v_str.to_string()),
+                            "insurance" => patient.insurance = Some(v_str.to_string()),
+                            "risk_level" => patient.risk_level = Some(v_str.to_string()),
+                            "age" => {
+                                if let Ok(v) = v_str.parse::<f32>() {
+                                    patient.age = Some(v)
+                                }
+                            }
+                            "blood_pressure" => {
+                                if let Ok(v) = v_str.parse::<f32>() {
+                                    patient.blood_pressure = Some(v)
+                                }
+                            }
+                            "systolic_bp" => {
+                                if let Ok(v) = v_str.parse::<f32>() {
+                                    patient.systolic_bp = Some(v)
+                                }
+                            }
+                            "diastolic_bp" => {
+                                if let Ok(v) = v_str.parse::<f32>() {
+                                    patient.diastolic_bp = Some(v)
+                                }
+                            }
+                            "glucose" => {
+                                if let Ok(v) = v_str.parse::<f32>() {
+                                    patient.glucose = Some(v)
+                                }
+                            }
+                            "bmi" => {
+                                if let Ok(v) = v_str.parse::<f32>() {
+                                    patient.bmi = Some(v)
+                                }
+                            }
+                            "pregnancies" => {
+                                if let Ok(v) = v_str.parse::<u32>() {
+                                    patient.pregnancies = Some(v)
+                                }
+                            }
+                            "existing_outcome" => {
+                                if let Ok(v) = v_str.parse::<f32>() {
+                                    patient.existing_outcome = Some(v)
+                                }
+                            }
+                            "cause_code" => {
+                                if let Ok(v) = v_str.parse::<u32>() {
+                                    patient.cause_code = Some(v)
+                                }
+                            }
+                            _ => {}
+                        },
+                        ColAction::Extra(col_name) => {
+                            if let Ok(v) = v_str.parse::<f32>() {
+                                patient.extra_features.insert(col_name.clone(), v);
+                            }
                         }
                     }
                 }
             }
-            // Map known columns and store unknown numeric columns as extra_features
+
+            if skip_patient {
+                continue;
+            }
 
             batch.push(patient);
 
-            // Flush batch when full
             if batch.len() >= BATCH_SIZE {
                 self.insert_patient_batch(&batch, dataset_source)?;
                 total_count += batch.len();
@@ -1580,13 +1711,42 @@ impl DatabaseManager {
         patients: &[PatientData],
         dataset_source: Option<&str>,
     ) -> AppResult<()> {
+        let mut tx = self.conn.transaction()?;
+
         for patient in patients {
-            self.upsert_patient(patient)?;
+            Self::upsert_patient_tx(&tx, patient, dataset_source)?;
+
+            if !patient.temporal_measurements.is_empty() {
+                let mut stmt = tx.prepare_cached(
+                    "INSERT INTO temporal_measurements (patient_id, timestamp, measurement_type, value)
+                        VALUES (?, ?, ?, ?)",
+                )?;
+                for m in &patient.temporal_measurements {
+                    stmt.execute(params![
+                        patient.patient_id,
+                        m.timestamp,
+                        m.measurement_type,
+                        m.value
+                    ])?;
+                }
+            }
+
+            if !patient.clinical_notes.is_empty() {
+                let mut stmt = tx.prepare_cached(
+                    "INSERT INTO clinical_notes (patient_id, content) VALUES (?, ?)",
+                )?;
+                for note in &patient.clinical_notes {
+                    stmt.execute(params![patient.patient_id, note])?;
+                }
+            }
         }
+
+        tx.commit()?;
         Ok(())
     }
 
-    /// Import multiple CSV files from a directory
+    /// Import multiple CSV files from a directory, including subdirectories.
+    /// Determines `dataset_source` based on folder structure if not explicitly provided.
     pub fn import_csv_directory<P: AsRef<Path>>(
         &mut self,
         dir: P,
@@ -1594,20 +1754,60 @@ impl DatabaseManager {
         dataset_source: Option<&str>,
     ) -> AppResult<usize> {
         let mut total = 0;
+        let base_dir = dir.as_ref();
 
-        let entries = std::fs::read_dir(&dir).map_err(|e| {
-            rusqlite::Error::InvalidParameterName(format!("Failed to read directory: {}", e))
-        })?;
+        // We'll use a stack to process directories recursively
+        let mut dirs_to_visit = vec![base_dir.to_path_buf()];
 
-        for entry in entries {
-            let entry = entry.map_err(|e| {
-                rusqlite::Error::InvalidParameterName(format!("Directory entry error: {}", e))
+        while let Some(current_dir) = dirs_to_visit.pop() {
+            let entries = std::fs::read_dir(&current_dir).map_err(|e| {
+                rusqlite::Error::InvalidParameterName(format!(
+                    "Failed to read directory {}: {}",
+                    current_dir.display(),
+                    e
+                ))
             })?;
-            let path = entry.path();
 
-            if path.extension().and_then(|s| s.to_str()) == Some("csv") {
-                info!("Importing: {}", path.display());
-                total += self.import_csv(&path, patient_id_column, dataset_source)?;
+            for entry in entries {
+                let entry = entry.map_err(|e| {
+                    rusqlite::Error::InvalidParameterName(format!("Directory entry error: {}", e))
+                })?;
+                let path = entry.path();
+
+                if path.is_dir() {
+                    dirs_to_visit.push(path);
+                } else if path.extension().and_then(|s| s.to_str()) == Some("csv") {
+                    info!("Importing: {}", path.display());
+
+                    let derived_source = if let Ok(rel_path) = path.strip_prefix(base_dir) {
+                        // If it's in a subfolder, use the top-level subfolder name.
+                        // Example: "MyDataset/metadata.csv" -> "MyDataset"
+                        let mut components = rel_path.components();
+                        let first_component = components.next();
+                        let second_component = components.next();
+
+                        if second_component.is_some() {
+                            // It's nested in a folder
+                            first_component
+                                .and_then(|c| c.as_os_str().to_str())
+                                .map(|s| s.to_string())
+                        } else {
+                            // It's directly in the base dir, use the file stem
+                            path.file_stem()
+                                .and_then(|s| s.to_str())
+                                .map(|s| s.to_string())
+                        }
+                    } else {
+                        // Fallback
+                        path.file_stem()
+                            .and_then(|s| s.to_str())
+                            .map(|s| s.to_string())
+                    };
+
+                    let source_to_use = dataset_source.or(derived_source.as_deref());
+
+                    total += self.import_csv(&path, patient_id_column, source_to_use)?;
+                }
             }
         }
 
@@ -1626,12 +1826,14 @@ impl DatabaseManager {
     ) -> AppResult<()> {
         tx.execute(
             "INSERT INTO patients (
-                patient_id, age, blood_pressure, systolic_bp, diastolic_bp,
+                patient_id, age, race, insurance, blood_pressure, systolic_bp, diastolic_bp,
                 glucose, bmi, pregnancies, risk_level, has_complications,
                 risk_score, existing_outcome, cause_code, image_count, has_ultrasound, dataset_source
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
             ON CONFLICT(patient_id) DO UPDATE SET
                 age = coalesce(excluded.age, age),
+                race = coalesce(excluded.race, race),
+                insurance = coalesce(excluded.insurance, insurance),
                 blood_pressure = coalesce(excluded.blood_pressure, blood_pressure),
                 systolic_bp = coalesce(excluded.systolic_bp, systolic_bp),
                 diastolic_bp = coalesce(excluded.diastolic_bp, diastolic_bp),
@@ -1650,6 +1852,8 @@ impl DatabaseManager {
             params![
                 patient.patient_id,
                 patient.age,
+                patient.race,
+                patient.insurance,
                 patient.blood_pressure,
                 patient.systolic_bp,
                 patient.diastolic_bp,
@@ -2058,6 +2262,23 @@ impl DatabaseManager {
             method: NormalizationMethod::ZScore,
             missing_value: 0.0,
         }))
+    }
+
+    /// Removes patients that are not part of the maternal cohort.
+    pub fn cleanup_non_maternal_patients(&mut self) -> AppResult<usize> {
+        let tx = self.conn.transaction()?;
+
+        let deleted = tx.execute(
+            "DELETE FROM patients
+            WHERE pregnancies = 0
+	            OR (pregnancies IS NULL
+	                AND dataset_source NOT LIKE '%maternal%'
+	                AND dataset_source NOT LIKE '%preg%')",
+            [],
+        )?;
+
+        tx.commit()?;
+        Ok(deleted)
     }
 
     // =========================================================================

@@ -1,5 +1,6 @@
 use crate::core::Module;
 use rand::Rng;
+use rand_distr::{Distribution, Normal};
 
 #[derive(Debug)]
 pub enum WeightType {
@@ -46,6 +47,8 @@ pub enum Activation {
     Tanh,
     /// ReLU activation - alternative for hidden layers
     ReLU,
+    /// Leaky ReLU activation - alternative for hidden layers
+    LeakyReLU,
 }
 
 /// The basic computational unit of a neural network.
@@ -99,12 +102,16 @@ impl Neuron {
             Activation::ReLU => (2.0 / num_inputs as f32).sqrt(),
             Activation::Sigmoid | Activation::Tanh => (2.0 / (num_inputs as f32 + 1.0)).sqrt(),
             Activation::None => (1.0 / num_inputs as f32).sqrt(),
+            Activation::LeakyReLU => (2.0 / num_inputs as f32).sqrt(),
         };
+
+        // Create a normal distribution
+        let normal_dist = Normal::new(0.0, std).unwrap();
 
         Neuron {
             weights: WeightType::F32(
                 (0..num_inputs)
-                    .map(|_| rng.random_range(-std..std))
+                    .map(|_| normal_dist.sample(&mut rng))
                     .collect(),
             ),
             bias: 0.0,
@@ -218,6 +225,7 @@ impl Neuron {
             Activation::Sigmoid => crate::utils::sigmoid(x),
             Activation::Tanh => crate::utils::tanh(x),
             Activation::ReLU => crate::utils::relu(x),
+            Activation::LeakyReLU => crate::utils::leaky_relu(x),
         }
     }
 
@@ -228,6 +236,7 @@ impl Neuron {
             Activation::Sigmoid => crate::utils::sigmoid_derivative(output),
             Activation::Tanh => crate::utils::tanh_derivative(output),
             Activation::ReLU => crate::utils::relu_derivative(x),
+            Activation::LeakyReLU => crate::utils::leaky_relu_derivative(x),
         }
     }
 }

@@ -7,10 +7,10 @@
 //! 4. Evaluate performance with calibrated predictions
 //! 5. Make predictions on new data for maternal mortality risk
 
-use chrono::Utc;
+use chrono::{Local, Utc};
 use clap::Parser;
 use sha2::{Digest, Sha256};
-use std::{collections::HashMap, fmt::Debug};
+use std::{collections::HashMap, fmt::Debug, fs, path::Path};
 use tracing::{error, info, warn};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -94,14 +94,34 @@ fn main() -> AppResult<()> {
     // Parse command-line arguments
     let args = Args::parse();
 
-    // Initialize logging
+    // Generate log filename with timestamp
+    let timestamp = Local::now().format("%Y-%m-%d_%H-%M-%S");
+    let log_path = format!("logs/training_{}.jsonl", timestamp);
+    fs::create_dir_all("logs")?;
+
+    // Create file appender
+    let log_file = fs::File::create(&log_path).map_err(|e| {
+        AppError::from(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("Failed to create log file: {}", e),
+        ))
+    })?;
+
+    // Initialize logging with both console and file output
+    // The file layer must use the same format type for compatibility
     if args.verbose {
+        let file_layer = fmt::layer().with_writer(log_file).with_ansi(false).pretty();
+
         tracing_subscriber::registry()
             .with(fmt::layer().pretty())
+            .with(file_layer)
             .init();
     } else {
+        let file_layer = fmt::layer().with_writer(log_file).with_ansi(false).json();
+
         tracing_subscriber::registry()
             .with(fmt::layer().json())
+            .with(file_layer)
             .init();
     }
 
@@ -134,26 +154,26 @@ fn main() -> AppResult<()> {
 
     // Override training parameters if provided
     if let Some(epochs) = args.epochs {
-        settings.epochs = epochs;
+        settings.training.epochs = epochs;
     }
     if let Some(batch_size) = args.batch_size {
-        settings.batch_size = batch_size;
+        settings.training.batch_size = batch_size;
     }
     if let Some(learning_rate) = args.learning_rate {
-        settings.learning_rate = learning_rate;
+        settings.training.learning_rate = learning_rate;
     }
     if args.no_privacy {
-        settings.use_privacy = false;
+        settings.training.use_privacy = false;
         warn!("Privacy DISABLED - for debugging only!");
     }
     if let Some(epsilon) = args.epsilon {
-        settings.privacy_epsilon = epsilon;
+        settings.training.privacy_epsilon = epsilon;
     }
     if let Some(clip_norm) = args.clip_norm {
-        settings.gradient_clip_norm = clip_norm;
+        settings.training.gradient_clip_norm = clip_norm;
     }
     if args.adaptive_lr {
-        settings.use_adaptive_lr = true;
+        settings.training.use_adaptive_lr = true;
     }
 
     // Validate modality configuration
@@ -167,13 +187,13 @@ fn main() -> AppResult<()> {
         "  Enabled modalities: {:?}",
         settings.modality_config.enabled_modalities()
     );
-    info!("  Epochs: {}", settings.epochs);
-    info!("  Batch size: {}", settings.batch_size);
-    info!("  Learning rate: {}", settings.learning_rate);
+    info!("  Epochs: {}", settings.training.epochs);
+    info!("  Batch size: {}", settings.training.batch_size);
+    info!("  Learning rate: {}", settings.training.learning_rate);
     info!("  Database: {:?}", args.database);
 
     // =========================================================
-    // Step 1: LOAD DATA FROM DATABASE (instead of from files)
+    // Step 1: LOAD DATA FROM DATABASE (built with prepare binary)
     // =========================================================
 
     info!("Loading data from database: {}", args.database);
@@ -387,11 +407,11 @@ fn main() -> AppResult<()> {
 
     // Define population-level cause frequencies
     let mut cause_frequencies = HashMap::new();
-    cause_frequencies.insert(0, 0.25); // Hemorrhage: 25% of deaths
+    cause_frequencies.insert(0, 0.21); // Hemorrhage: 21% of deaths
     cause_frequencies.insert(1, 0.20); // Hypertensive disorders: 20%
-    cause_frequencies.insert(2, 0.15); // Infection/sepsis: 15%
-    cause_frequencies.insert(3, 0.10); // Thromboembolism: 10%
-    cause_frequencies.insert(4, 0.30); // Other causes: 30%
+    cause_frequencies.insert(2, 0.11); // Infection/sepsis: 11%
+    cause_frequencies.insert(3, 0.08); // Abortion + Miscarriage: 8%
+    cause_frequencies.insert(4, 0.40); // Other causes: 40%
 
     let cause_weights = CauseWeights::from_population_frequencies(&cause_frequencies);
 
@@ -420,8 +440,13 @@ fn main() -> AppResult<()> {
         Some(&stratum_multipliers),
     );
 
-    let sample_weights =
-        SmoteSynthesizer::apply_cause_weights(&base_sample_weights, &causes, &cause_weights);
+    let sample_weights = SmoteSynthesizer::apply_cause_weights(
+        &base_sample_weights,
+        &causes,
+        &cause_weights,
+        &targets,
+        Some(5.0), // Cap to prevent extreme gradients
+    );
 
     // Calculate actual prevalence from the data
     let positive_samples = targets.iter().filter(|&&t| t > 0.5).count();
@@ -468,7 +493,7 @@ fn main() -> AppResult<()> {
         .map(|d| d.images.clone())
         .unwrap_or_default();
 
-    let (train_data, val_data, train_targets, val_targets, train_weights, val_weights) =
+    let (train_data, val_data, train_targets, val_targets, mut train_weights, val_weights) =
         split_data_with_weights(
             &tabular_vec,
             &temporal_vec,
@@ -557,20 +582,25 @@ fn main() -> AppResult<()> {
         model.enabled_modalities()
     );
 
+    // Initialize output bias to match base rate for faster convergence
+    model.set_output_bias_for_base_rate(actual_prevalence);
+    info!(
+        "  Output bias initialized for {:.2}% base rate",
+        actual_prevalence * 100.0
+    );
+
     // Step 6: Create SMOTE synthesizer for minority class oversampling
     let _smote = SmoteSynthesizer::new(5);
 
     // Step 7: Train the model
     info!("Training model with population-weighted samples...");
 
-    let training_config = TrainingParams::default();
-
     train_model_with_weights(
         &mut model,
         &mut train_loader,
         &mut val_loader,
-        &training_config,
-        &train_weights,
+        &settings.training,
+        &mut train_weights,
         &val_weights,
         &calibrator,
     );
@@ -648,7 +678,7 @@ fn main() -> AppResult<()> {
     info!("Saving trained model...");
 
     std::fs::create_dir_all(&args.output_dir)?;
-    let model_path = format!("{}/maternal_mortality_model_modular.bin", args.output_dir);
+    let model_path = format!("{}/ahuvista-nn.bin", args.output_dir);
     model.save(&model_path)?;
     info!("  Model saved to: {}", model_path);
 

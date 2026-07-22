@@ -24,6 +24,7 @@ Thumbs.db
 
 # Ignore log files
 *.log
+logs/
 
 # Ignore environment variables
 .env
@@ -41,3 +42,15 @@ Thumbs.db
 
 # Ignore datasets directory (must provide your own data)
 datasets/
+
+# SQLite database files
+*.db
+*.db-wal
+*.db-shm
+
+# Binary output files
+*.exe
+*.dll
+*.so
+*.dylib
+*.bin

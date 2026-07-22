@@ -47,7 +47,7 @@ impl Network {
         );
 
         let mut network = Network::new();
-        let hidden_act = hidden_activation.unwrap_or(Activation::ReLU);
+        let hidden_act = hidden_activation.unwrap_or(Activation::LeakyReLU);
         let output_act = output_activation.unwrap_or(Activation::None);
 
         for i in 0..layer_sizes.len() - 1 {

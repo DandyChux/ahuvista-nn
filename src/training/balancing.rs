@@ -34,8 +34,11 @@ pub fn compute_class_weights(labels: &[f32]) -> HashMap<i32, f32> {
     let mut class_weights = HashMap::new();
 
     for (&class_label, &count) in &class_counts {
-        let weight = total_samples as f32 / (num_classes as f32 * count as f32);
-        class_weights.insert(class_label, weight);
+        // Use sqrt(total/count) instead of raw inverse frequency
+        let weight = (total_samples as f32 / (num_classes as f32 * count as f32)).sqrt();
+        // Cap weight ratio to prevent extreme gradients
+        let capped_weight = weight.min(3.0);
+        class_weights.insert(class_label, capped_weight);
     }
 
     class_weights
@@ -75,7 +78,9 @@ pub fn compute_sample_weights(
             }
         }
 
-        sample_weights.push(weight);
+        // Cap final weight to prevent extreme gradients
+        let capped_weight = weight.min(10.0);
+        sample_weights.push(capped_weight);
     }
 
     sample_weights
@@ -127,12 +132,20 @@ impl CauseWeights {
         for (&cause, &freq) in cause_to_frequency {
             let relative_freq = freq / total_frequency;
             // Small causes get higher weights
-            cause_weights.insert(cause, 1.0 / relative_freq.max(0.01)); // Avoid division by zero
+            cause_weights.insert(cause, (1.0 / relative_freq.max(0.01)).sqrt());
         }
+
+        // Compute mean weight for unseen causes
+        // This ensures unseen causes are treated as "average" importance
+        let mean_weight = if cause_weights.is_empty() {
+            1.0
+        } else {
+            cause_weights.values().sum::<f32>() / cause_weights.len() as f32
+        };
 
         CauseWeights {
             cause_weights,
-            default_weight: 1.0,
+            default_weight: mean_weight,
         }
     }
 
@@ -172,16 +185,42 @@ impl SmoteSynthesizer {
         }
     }
 
-    /// Apply cause-specific weights to base sample weights
+    /// Apply cause-specific weights to base sample weights (only for positive/mortality samples)
+    ///
+    /// # Arguments
+    /// * `base_weights` - Base sample weights from class/strata weighting
+    /// * `causes` - Cause ID for each sample
+    /// * `cause_weights` - CauseWeights instance with cause-specific multipliers
+    /// * `targets` - Target values (0.0 for survival, 1.0 for mortality)
+    /// * `max_weight` - Optional cap on final weight to prevent extreme gradients
+    ///
+    /// # Returns
+    /// Vector of final sample weights
     pub fn apply_cause_weights(
         base_weights: &[f32],
         causes: &[usize],
         cause_weights: &CauseWeights,
+        targets: &[f32],
+        max_weight: Option<f32>,
     ) -> Vec<f32> {
         base_weights
             .iter()
             .zip(causes.iter())
-            .map(|(&base_weight, &cause)| cause_weights.apply(base_weight, cause))
+            .zip(targets.iter())
+            .map(|((&base_weight, &cause), &target)| {
+                let weight = if target > 0.5 {
+                    // Only apply cause weights to mortality cases
+                    cause_weights.apply(base_weight, cause)
+                } else {
+                    // Survival cases keep base weight (class + strata only)
+                    base_weight
+                };
+                // Apply optional cap
+                match max_weight {
+                    Some(cap) => weight.min(cap),
+                    None => weight,
+                }
+            })
             .collect()
     }
 
@@ -315,16 +354,30 @@ impl BayesianCalibrator {
         // Clip prediction to avoid numerical issues
         let p = raw_prediction.max(1e-6).min(1.0 - 1e-6);
 
-        // Simple Bayesian adjustment (simplified for demonstration)
-        // In a real implementation, you would use proper Bayesian methods
-        let odds_ratio = p / (1.0 - p);
-        let pop_odds = self.population_prevalence / (1.0 - self.population_prevalence);
+        // Bayes' theorem:
+        // P(Y=1|X, π_p) = P(X|Y=1) * π_p / P(X)
+        //
+        // The likelihood ratio (LR) can be derived from the model's prediction:
+        // LR = P(X|Y=1) / P(X|Y=0) = [p / (1-p)] * [(1-π_s) / π_s]
+        //
+        // Then the calibrated probability is:
+        // P(Y=1|X, π_p) = LR * π_p / (LR * π_p + (1 - π_p))
+        //
+        // Convert model prediction to likelihood ratio
+        // LR = p / (1 - p) when trained on balanced data
+        let likelihood_ratio = p / (1.0 - p);
 
-        // Adjust odds by population prevalence
-        let adjusted_odds = odds_ratio * pop_odds;
+        // Apply Bayes' theorem with population prevalence as prior
+        // P(Y=1|X) = LR * P(Y=1) / (LR * P(Y=1) + P(Y=0))
+        //          = LR * π / (LR * π + (1 - π))
+        let numerator = likelihood_ratio * self.population_prevalence;
+        let denominator = numerator + (1.0 - self.population_prevalence);
 
-        // Convert back to probability
-        adjusted_odds / (1.0 + adjusted_odds)
+        // Return calibrated posterior probability
+        let calibrated = numerator / denominator;
+
+        // Ensure output is in valid probability range
+        calibrated.max(1e-6).min(1.0 - 1e-6)
     }
 }
 
@@ -353,6 +406,17 @@ pub fn weighted_binary_cross_entropy(
         let target = targets[i];
         let weight = sample_weights[i];
 
+        // Debug: check for invalid values
+        // if i < 5 || z.is_nan() || z.is_infinite() || weight < 0.0 {
+        //     tracing::debug!(
+        //         "BCE sample {}: z={}, target={}, weight={}",
+        //         i,
+        //         z,
+        //         target,
+        //         weight
+        //     );
+        // }
+
         // Numerically stable BCE loss calculation
         // loss = max(z, 0) - z * y + log(1 + exp(-|z|))
         let loss = if z >= 0.0 {
@@ -360,6 +424,11 @@ pub fn weighted_binary_cross_entropy(
         } else {
             -z * target + (1.0 + z.exp()).ln()
         };
+
+        // Debug: check for negative individual loss
+        if loss < 0.0 {
+            tracing::warn!("Negative loss! z={}, target={}, loss={}", z, target, loss);
+        }
 
         let weighted_loss = loss * weight;
         total_weighted_loss += weighted_loss;

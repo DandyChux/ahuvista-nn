@@ -267,7 +267,7 @@ If outcome files don't exist, the system generates them using:
    - High BP → Hypertensive disorders (code 1)
    - Multiple pregnancies + age → Hemorrhage (code 0)
    - High glucose → Infection/sepsis (code 2)
-   - High BMI + age → Thromboembolism (code 3)
+   - High BMI + age → Abortion + Miscarriage (code 3)
    - Other/None → code 4 (includes all survivors)
 
 ### Key Benefits
@@ -982,7 +982,7 @@ let mut cause_frequencies = HashMap::new();
 cause_frequencies.insert(0, 0.25); // Hemorrhage: 25%
 cause_frequencies.insert(1, 0.20); // Hypertensive disorders: 20%
 cause_frequencies.insert(2, 0.15); // Infection: 15%
-cause_frequencies.insert(3, 0.10); // Thromboembolism: 10%
+cause_frequencies.insert(3, 0.10); // Abortion + Miscarriage: 8%
 cause_frequencies.insert(4, 0.30); // Other: 30%
 
 let cause_weights = CauseWeights::from_population_frequencies(&cause_frequencies);

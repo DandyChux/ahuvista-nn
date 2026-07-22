@@ -2,6 +2,7 @@
 
 use csv::{ReaderBuilder, Writer};
 use ndarray::Array3;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
@@ -99,6 +100,8 @@ pub struct TemporalMeasurement {
 pub struct PatientData {
     pub patient_id: String,
     pub age: Option<f32>,
+    pub race: Option<String>,
+    pub insurance: Option<String>,
     pub blood_pressure: Option<f32>,
     pub systolic_bp: Option<f32>,
     pub diastolic_bp: Option<f32>,
@@ -359,6 +362,8 @@ pub struct MultiModalDataLoader {
     pub targets: Vec<f32>,
     /// Current position in the dataset
     pub current_idx: usize,
+    /// Shuffled index permutation (used for accessing data in random order)
+    pub indices: Vec<usize>,
 }
 
 impl MultiModalDataLoader {
@@ -424,6 +429,7 @@ impl MultiModalDataLoader {
 
         assert!(has_data, "At least one modality must have data");
 
+        let n = targets.len();
         MultiModalDataLoader {
             tabular_data,
             temporal_data,
@@ -431,6 +437,7 @@ impl MultiModalDataLoader {
             image_data,
             targets,
             current_idx: 0,
+            indices: (0..n).collect(), // identity permutation initially
         }
     }
 }
@@ -452,7 +459,9 @@ impl DataLoader<MultiModalBatch> for MultiModalDataLoader {
             targets: Vec::with_capacity(batch_size),
         };
 
-        for i in self.current_idx..end_idx {
+        for idx in self.current_idx..end_idx {
+            let i = self.indices[idx];
+
             if !self.tabular_data.data.is_empty() {
                 batch.tabular.push(self.tabular_data.data[i].clone());
             }
@@ -481,6 +490,23 @@ impl DataLoader<MultiModalBatch> for MultiModalDataLoader {
 
     fn len(&self) -> usize {
         self.targets.len()
+    }
+}
+
+impl MultiModalDataLoader {
+    /// Shuffle the data ordering for the next epoch
+    /// Also shuffles the provided weights array in the same order
+    pub fn shuffle(&mut self, weights: &mut [f32]) {
+        use rand::seq::SliceRandom;
+        let mut rng = rand::rng();
+
+        // Fisher-Yates shufle, applied to indices and weights simultaneously
+        let n = self.indices.len();
+        for i in (1..n).rev() {
+            let j = rng.random_range(0..=i);
+            self.indices.swap(i, j);
+            weights.swap(i, j);
+        }
     }
 }
 

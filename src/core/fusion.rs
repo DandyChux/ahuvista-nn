@@ -3,6 +3,7 @@ use crate::core::{Activation, Layer, Module, Network};
 use crate::models::{ImageNet, TabularNet, TemporalNet, TextNet};
 use crate::utils::error::{AppError, AppResult};
 use ndarray::{Array3, ArrayBase};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tracing::{error, info};
 
@@ -55,6 +56,55 @@ impl Default for MultiModalInput {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Input data structure for predictions
+#[derive(Debug, Deserialize)]
+pub struct PredictionInput {
+    /// Tabular features (optional if modality not enabled)
+    #[serde(default)]
+    pub tabular: Option<Vec<f32>>,
+
+    /// Temporal sequence data (optional if modality not enabled)
+    #[serde(default)]
+    pub temporal: Option<Vec<Vec<f32>>>,
+
+    /// Text data as raw string (optional if modality not enabled)
+    #[serde(default)]
+    pub text: Option<String>,
+
+    /// Path to image file (optional if modality not enabled)
+    #[serde(default)]
+    pub image_path: Option<String>,
+
+    /// Optional patient identifier (for logging/tracking)
+    #[serde(default)]
+    pub patient_id: Option<String>,
+}
+
+/// Output data structure for predictions
+#[derive(Debug, Serialize)]
+pub struct PredictionOutput {
+    /// Raw model output score (0-1)
+    pub risk_score: f32,
+
+    /// Calibrated risk score if calibration was applied
+    pub calibrated_score: Option<f32>,
+
+    /// Risk category (MINIMAL, LOW, MODERATE, HIGH, CRITICAL)
+    pub risk_category: String,
+
+    /// Confidence in the prediction
+    pub confidence: f32,
+
+    /// Which modalities were used for this prediction
+    pub modalities_used: Vec<String>,
+
+    /// Optional patient identifier
+    pub patient_id: Option<String>,
+
+    /// Timestamp of prediction
+    pub timestamp: String,
 }
 
 /// Modular multimodal network that supports selective modality processing.
@@ -146,7 +196,7 @@ impl LateFusionNet {
                 input_size,
                 &hidden_sizes,
                 output_size,
-                Some(Activation::ReLU),
+                Some(Activation::LeakyReLU),
                 None,
             ))
         } else {
@@ -196,7 +246,7 @@ impl LateFusionNet {
         let mut prev_size = fused_size;
 
         for &size in classifier_hidden_sizes {
-            classifier.add_layer(Layer::new(size, prev_size, Activation::ReLU));
+            classifier.add_layer(Layer::new(size, prev_size, Activation::LeakyReLU));
             prev_size = size;
         }
 
@@ -496,7 +546,7 @@ impl LateFusionNet {
     }
 
     /// Get all parameters from enabled subnetworks
-    fn get_all_parameters(&self) -> Vec<f32> {
+    pub fn get_all_parameters(&self) -> Vec<f32> {
         let mut params = Vec::new();
 
         if let Some(ref net) = self.tabular_net {
@@ -544,6 +594,23 @@ impl LateFusionNet {
         }
 
         Ok(())
+    }
+
+    /// Set the bias of the final output layer to match a target base rate.
+    /// This helps training converge faster by starting predictions near the data's true rate.
+    ///
+    /// # Arguments
+    /// * `positive_rate` - The proportion of positive samples (e.g., 0.1 for 10%)
+    pub fn set_output_bias_for_base_rate(&mut self, positive_rate: f32) {
+        // logit(p) = ln(p / (1-p))
+        let target_bias = (positive_rate / (1.0 - positive_rate)).ln();
+
+        // Get the last layer (output layer) of the classifier
+        if let Some(last_layer) = self.classifier.layers.last_mut() {
+            if let Some(neuron) = last_layer.neurons.first_mut() {
+                neuron.bias = target_bias;
+            }
+        }
     }
 }
 

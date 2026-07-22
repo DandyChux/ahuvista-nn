@@ -1,23 +1,24 @@
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
     config::TrainingParams,
     core::{Module, PrivacyEngine, fusion::LateFusionNet},
-    data::{DataLoader, MultiModalBatch},
+    data::{DataLoader, MultiModalBatch, loader::MultiModalDataLoader},
     training::{
         balancing::{BayesianCalibrator, weighted_binary_cross_entropy},
         loss::binary_cross_entropy,
-        metrics::{ConfusionMatrix, EvaluationMetrics, calculate_auroc},
+        metrics::{ConfusionMatrix, EvaluationMetrics, calculate_auprc, calculate_auroc},
+        optimizer::Adam,
     },
 };
 
 /// Train the model with sample weights and calibration
 pub fn train_model_with_weights(
     model: &mut LateFusionNet,
-    train_loader: &mut impl DataLoader<MultiModalBatch>,
+    train_loader: &mut MultiModalDataLoader,
     val_loader: &mut impl DataLoader<MultiModalBatch>,
     config: &TrainingParams,
-    train_weights: &[f32],
+    train_weights: &mut [f32],
     val_weights: &[f32],
     calibrator: &BayesianCalibrator,
 ) {
@@ -38,37 +39,46 @@ pub fn train_model_with_weights(
         None
     };
 
-    let mut current_lr = config.learning_rate;
-    let mut total_batches = 0;
+    // Initialize Adam optimizer — determine parameter count from the gradient vector
+    model.zero_grad();
+    let num_params = model.gradients().len();
+    let mut optimizer =
+        Adam::with_weight_decay(num_params, config.learning_rate, config.weight_decay);
+    info!(
+        "Adam optimizer initialized: {} parameters, lr={}, weight_decay={}",
+        num_params, config.learning_rate, config.weight_decay
+    );
+
+    let mut total_batches: usize = 0;
 
     for epoch in 0..config.epochs {
+        // Shuffle training data at the start of each epoch
+        train_loader.shuffle(train_weights);
+
         // Training phase
         train_loader.reset();
         let mut sample_idx = 0;
-        let mut epoch_predictions = Vec::new();
-        let mut epoch_targets = Vec::new();
-        let mut epoch_losses = Vec::new();
+        let mut epoch_predictions: Vec<f32> = Vec::new();
+        let mut epoch_targets: Vec<f32> = Vec::new();
+        let mut epoch_logits: Vec<f32> = Vec::new();
+        let mut epoch_weights: Vec<f32> = Vec::new();
+        let mut epoch_losses: Vec<f32> = Vec::new();
 
         // Process batches
         while let Some(batch) = train_loader.next_batch(config.batch_size) {
             let batch_size = batch.targets.len();
             total_batches += 1;
 
-            // Adaptive learning rate decay
-            if config.use_adaptive_lr && total_batches % config.lr_decay_steps == 0 {
-                current_lr = (current_lr * config.lr_decay_rate).max(config.min_learning_rate);
-                info!("Learning rate adjusted to: {:.6}", current_lr);
-            }
+            // Zero gradients before batch processing
+            model.zero_grad();
 
-            // Collect batch data
             let mut batch_logits = Vec::with_capacity(batch_size);
             let mut batch_targets = Vec::with_capacity(batch_size);
             let mut batch_weights = Vec::with_capacity(batch_size);
-            let mut batch_inputs = Vec::with_capacity(batch_size);
+            let mut batch_loss_sum = 0.0_f32;
 
-            // Process each sample in the batch
+            // Single-pass: forward, compute per-sample gradient, backward — no re-forward needed
             for i in 0..batch_size {
-                // Get sample weight
                 let sample_weight = if sample_idx < train_weights.len() {
                     train_weights[sample_idx]
                 } else {
@@ -76,7 +86,7 @@ pub fn train_model_with_weights(
                 };
                 sample_idx += 1;
 
-                // Forward pass
+                // Prepare inputs
                 let tabular_input = if i < batch.tabular.len() {
                     batch.tabular[i].clone()
                 } else {
@@ -101,36 +111,44 @@ pub fn train_model_with_weights(
                     ndarray::Array3::<f32>::zeros((0, 0, 0))
                 };
 
-                batch_inputs.push((tabular_input, temporal_input, text_input, image_input));
-                batch_targets.push(batch.targets[i]);
-                batch_weights.push(sample_weight);
-            }
+                // Forward pass — cached activations are set for this sample
+                let logit_output =
+                    model.forward((tabular_input, temporal_input, text_input, image_input));
+                let logit = logit_output[0];
+                let target = batch.targets[i];
 
-            // Zero gradients before batch processing
-            model.zero_grad();
+                // Compute probability via sigmoid
+                let p = 1.0 / (1.0 + (-logit).exp());
 
-            // Process entire batch
-            for i in 0..batch_size {
-                // Forward pass - returns logits
-                let logit_output = model.forward(batch_inputs[i].clone());
-                let logit = logit_output[0]; // Single output for binary classification
+                // BCE gradient for this sample: (p - target) * weight
+                let grad = (p - target) * sample_weight;
+
+                // Backward pass — accumulates gradients inside the model
+                model.backward(vec![grad]);
+
+                // Numerically stable per-sample BCE loss: max(z,0) - z*y + log(1 + exp(-|z|))
+                let sample_loss = if logit >= 0.0 {
+                    logit - logit * target + (1.0 + (-logit).exp()).ln()
+                } else {
+                    -logit * target + (1.0 + logit.exp()).ln()
+                };
+                batch_loss_sum += sample_loss * sample_weight;
 
                 batch_logits.push(logit);
+                batch_targets.push(target);
+                batch_weights.push(sample_weight);
+
+                // Debug logging for first 3 samples of first batch
+                if epoch == 0 && total_batches == 1 && i < 3 {
+                    debug!(
+                        "Sample {}: logit={:.6}, prob={:.6}, target={}, loss_grad={:.6}",
+                        i, logit, p, target, grad
+                    );
+                }
             }
 
-            // Compute batch loss and gradients using logits
-            let (batch_loss, loss_gradients) =
-                weighted_binary_cross_entropy(&batch_logits, &batch_targets, &batch_weights);
-
-            // Backward pass for each sample in batch
-            // We need to accumulate gradients across the batch
-            for i in 0..batch_size {
-                // Re-forward to set up computational graph for this sample
-                let _ = model.forward(batch_inputs[i].clone());
-
-                // Backward pass with the gradient for this sample
-                model.backward(vec![loss_gradients[i]]);
-            }
+            // Compute mean batch loss (weighted)
+            let batch_loss = batch_loss_sum / batch_size as f32;
 
             // Convert logits to probabilities for metrics
             let batch_predictions: Vec<f32> = batch_logits
@@ -141,37 +159,25 @@ pub fn train_model_with_weights(
             // Store for epoch metrics
             epoch_predictions.extend(&batch_predictions);
             epoch_targets.extend(&batch_targets);
+            epoch_logits.extend(&batch_logits);
+            epoch_weights.extend(&batch_weights);
             epoch_losses.push(batch_loss);
-
-            // Debug logging for first batch of first epoch
-            if epoch == 0 && total_batches == 1 {
-                for i in 0..3.min(batch_size) {
-                    info!(
-                        "Sample {}: logit={:.6}, prob={:.6}, target={}, loss_grad={:.6}",
-                        i,
-                        batch_logits[i],
-                        batch_predictions[i],
-                        batch_targets[i],
-                        loss_gradients[i]
-                    );
-                }
-            }
 
             // Check prediction variance (important for debugging)
             let pred_variance = if batch_predictions.len() > 1 {
                 let mean = batch_predictions.iter().sum::<f32>() / batch_predictions.len() as f32;
-                let variance = batch_predictions
+                batch_predictions
                     .iter()
                     .map(|p| (p - mean).powi(2))
                     .sum::<f32>()
-                    / batch_predictions.len() as f32;
-                variance
+                    / batch_predictions.len() as f32
             } else {
                 0.0
             };
 
-            if epoch == 0 || (epoch + 1) % 10 == 0 {
-                info!(
+            // Log batch progress every 100 batches
+            if total_batches % 100 == 0 {
+                debug!(
                     "Epoch {} batch {}: loss={:.4}, pred_variance={:.8}",
                     epoch + 1,
                     total_batches,
@@ -180,36 +186,35 @@ pub fn train_model_with_weights(
                 );
             }
 
-            // Get accumulated gradients
+            // Get accumulated gradients and average by weight sum
             let mut model_grads = model.gradients();
-
-            // Average gradients over batch size
-            for grad in &mut model_grads {
-                *grad /= batch_size as f32;
+            let weight_sum: f32 = batch_weights.iter().sum();
+            if weight_sum > 0.0 {
+                for grad in &mut model_grads {
+                    *grad /= weight_sum;
+                }
             }
 
-            // Gradient clipping for stability
+            // Gradient clipping (applied to raw gradients BEFORE Adam)
             let grad_norm: f32 = model_grads.iter().map(|g| g * g).sum::<f32>().sqrt();
 
             if grad_norm < 1e-8 {
                 warn!("WARNING: Gradient norm too small: {:.2e}", grad_norm);
             } else if grad_norm > config.gradient_clip_norm {
-                // Clip gradients by norm
                 let scale = config.gradient_clip_norm / grad_norm;
                 for grad in &mut model_grads {
                     *grad *= scale;
                 }
-                info!(
+                debug!(
                     "Clipped gradients: norm was {:.4}, scaled to {:.4}",
                     grad_norm, config.gradient_clip_norm
                 );
             }
 
-            // Apply privacy if enabled
+            // Apply privacy noise if enabled
             if let Some(ref engine) = privacy_engine {
                 engine.privatize_gradients(&mut model_grads, config.gradient_clip_norm);
 
-                // Check if privacy noise is too large
                 let noisy_grad_norm: f32 = model_grads.iter().map(|g| g * g).sum::<f32>().sqrt();
                 if noisy_grad_norm / grad_norm > 10.0 {
                     warn!(
@@ -219,65 +224,53 @@ pub fn train_model_with_weights(
                 }
             }
 
-            // Apply gradients with current learning rate
-            model.apply_gradients(&model_grads, current_lr);
+            // Adam step with weight decay: needs current params for decoupled decay
+            let current_params = model.get_all_parameters();
+            let adam_updates = optimizer.step(&model_grads, &current_params);
+            model.apply_gradients(&adam_updates, 1.0); // lr=1.0; Adam already includes the step size
 
             // Zero gradients after applying
             model.zero_grad();
         }
 
         // Calculate epoch metrics
-        let epoch_auroc = calculate_auroc(&epoch_predictions, &epoch_targets);
-        let mean_loss = epoch_losses.iter().sum::<f32>() / epoch_losses.len() as f32;
-
-        // Log epoch statistics
-        if epoch == 0 || (epoch + 1) % 5 == 0 {
-            let mean_pred = epoch_predictions.iter().sum::<f32>() / epoch_predictions.len() as f32;
-            let std_pred = {
-                let variance = epoch_predictions
-                    .iter()
-                    .map(|p| (p - mean_pred).powi(2))
-                    .sum::<f32>()
-                    / epoch_predictions.len() as f32;
-                variance.sqrt()
-            };
-
-            info!(
-                "Epoch {}/{}: loss={:.4}, auroc={:.4}, mean_pred={:.6}, std_pred={:.6}, lr={:.6}",
-                epoch + 1,
-                config.epochs,
-                mean_loss,
-                epoch_auroc,
-                mean_pred,
-                std_pred,
-                current_lr
-            );
-        }
+        let train_loss = if epoch_losses.is_empty() {
+            0.0
+        } else {
+            epoch_losses.iter().sum::<f32>() / epoch_losses.len() as f32
+        };
 
         // Evaluate on validation set periodically
         if (epoch + 1) % config.val_frequency == 0 {
-            let (train_metrics, _) =
-                evaluate_model_with_calibration(model, train_loader, train_weights, calibrator);
-
             let (val_metrics, _) =
                 evaluate_model_with_calibration(model, val_loader, val_weights, calibrator);
 
             info!(
-                "Epoch {}/{}: Train loss={:.4}, acc={:.2}%, auroc={:.4} | Val loss={:.4}, acc={:.2}%, auroc={:.4}",
+                "Epoch {}/{}: Train loss={:.4} | Val [loss={:.4}, auroc={:.4}, mean={:.6}, std={:.6}] | lr={:.6}",
                 epoch + 1,
                 config.epochs,
-                train_metrics.loss,
-                train_metrics.accuracy * 100.0,
-                train_metrics.auroc,
+                train_loss,
                 val_metrics.loss,
-                val_metrics.accuracy * 100.0,
-                val_metrics.auroc
+                val_metrics.auroc,
+                val_metrics.mean_pred,
+                val_metrics.std_pred,
+                optimizer.lr()
             );
 
-            // Early stopping check
-            if train_metrics.auroc < 0.51 && epoch > 10 {
-                warn!("Model not learning (AUROC ~0.5), consider adjusting parameters");
+            // Early stopping check based on validation AUROC
+            if val_metrics.auroc < 0.55 && epoch > 10 {
+                warn!("Model not learning well (AUROC < 0.55), consider adjusting parameters");
             }
+        }
+
+        if config.use_adaptive_lr && (epoch + 1) % config.lr_decay_epochs == 0 {
+            let new_lr = (optimizer.lr() * config.lr_decay_rate).max(config.min_learning_rate);
+            optimizer.set_lr(new_lr);
+            info!(
+                "Learning rate decayed to: {:.6} (epoch {})",
+                new_lr,
+                epoch + 1
+            );
         }
     }
 }
@@ -290,9 +283,6 @@ pub fn evaluate_model_with_calibration(
     calibrator: &BayesianCalibrator,
 ) -> (EvaluationMetrics, Vec<f32>) {
     loader.reset();
-
-    // Return metrics AND calibration data
-    let mut total_loss = 0.0;
 
     // Need to collect all predictions and targets to calculate metrics like AUROC
     let mut all_logits = Vec::new();
@@ -357,6 +347,8 @@ pub fn evaluate_model_with_calibration(
     // the model's intrinsic ability to rank predictions.
     let auroc = calculate_auroc(&all_predictions, &all_targets);
 
+    let auprc = calculate_auprc(&all_predictions, &all_targets);
+
     // Apply calibration to probabilities
     let calibrated_predictions: Vec<f32> = all_predictions
         .iter()
@@ -386,7 +378,56 @@ pub fn evaluate_model_with_calibration(
         0.0
     };
 
-    let metrics = EvaluationMetrics::new(loss, accuracy, ppv, npv, sensitivity, specificity, auroc);
+    let mean_prediction =
+        calibrated_predictions.iter().sum::<f32>() / calibrated_predictions.len() as f32;
+
+    let std_prediction = calibrated_predictions
+        .iter()
+        .map(|&x| (x - mean_prediction).powi(2))
+        .sum::<f32>()
+        / calibrated_predictions.len() as f32;
+
+    let f1_score = if ppv + sensitivity > 0.0 {
+        2.0 * ppv * sensitivity / (ppv + sensitivity)
+    } else {
+        0.0
+    };
+
+    let mcc = if confusion.tp + confusion.fp > 0
+        && confusion.tp + confusion.fn_ > 0
+        && confusion.tn + confusion.fp > 0
+        && confusion.tn + confusion.fn_ > 0
+    {
+        let numerator =
+            (confusion.tp * confusion.tn) as f32 - (confusion.fp * confusion.fn_) as f32;
+        let denominator = ((confusion.tp + confusion.fp) as f32
+            * (confusion.tp + confusion.fn_) as f32
+            * (confusion.tn + confusion.fp) as f32
+            * (confusion.tn + confusion.fn_) as f32)
+            .sqrt();
+        numerator / denominator
+    } else {
+        0.0
+    };
+
+    // Calculate average of specifity and sensitivity
+    let balanced_accuracy = (sensitivity + specificity) / 2.0;
+
+    let metrics = EvaluationMetrics::new(
+        loss,
+        accuracy,
+        ppv,
+        npv,
+        sensitivity,
+        specificity,
+        auroc,
+        auprc,
+        mean_prediction,
+        std_prediction,
+        f1_score,
+        mcc,
+        balanced_accuracy,
+    );
 
     // You can now print or plot this calibration_data. A perfect calibration
     // would have pairs like (0.1, 0.1), (0.2, 0.2), etc.

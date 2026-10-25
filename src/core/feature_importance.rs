@@ -12,25 +12,29 @@ pub fn calculate_permutation_importance<I, O>(
     baseline_metrics: &EvaluationMetrics,
 ) -> HashMap<String, f32> {
     let mut importances = HashMap::new();
-    let feature_names = ["age", "blood_pressure", "bmi"]; // You'd get this from your TabularData struct
+    let feature_names = ["age", "blood_pressure", "bmi"]; // You'd get this from your StaticFeatureData struct
 
     for (i, feature_name) in feature_names.iter().enumerate() {
-        let perturbed_data: &mut MultiModalBatch = validation_data;
+        let mut feature_column: Vec<f32> = validation_data
+            .sequences
+            .iter()
+            .map(|sequence| sequence.static_features.get(i).copied().unwrap_or(0.0))
+            .collect();
 
-        // Shuffle the i-th column (feature) of the tabular data
-        let mut feature_column: Vec<_> = perturbed_data.tabular.iter().map(|row| row[i]).collect();
         feature_column.shuffle(&mut rng());
 
-        for (j, row) in perturbed_data.tabular.iter_mut().enumerate() {
-            row[i] = feature_column[j];
+        for (sequence, value) in validation_data
+            .sequences
+            .iter_mut()
+            .zip(feature_column.into_iter())
+        {
+            if i < sequence.static_features.len() {
+                sequence.static_features[i] = value;
+            }
         }
 
-        // Re-evaluate the model on the perturbed data
-        // This requires a simplified evaluation function that just returns one metric, e.g., AUROC
-        // Note: evaluate_auroc needs to be implemented or imported
-        let new_auroc = evalute_auroc::<I, O>(model, perturbed_data);
+        let new_auroc = evalute_auroc::<I, O>(model, validation_data);
 
-        // Importance is the drop in performance
         let importance = baseline_metrics.auroc - new_auroc;
         importances.insert(feature_name.to_string(), importance);
     }

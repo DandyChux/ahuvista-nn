@@ -1,5 +1,4 @@
 use crate::core::Module;
-use rand::Rng;
 use rand_distr::{Distribution, Normal};
 
 #[derive(Debug)]
@@ -222,10 +221,10 @@ impl Neuron {
     fn apply_activation(&self, x: f32) -> f32 {
         match self.activation {
             Activation::None => x,
-            Activation::Sigmoid => crate::utils::sigmoid(x),
-            Activation::Tanh => crate::utils::tanh(x),
-            Activation::ReLU => crate::utils::relu(x),
-            Activation::LeakyReLU => crate::utils::leaky_relu(x),
+            Activation::Sigmoid => super::sigmoid(x),
+            Activation::Tanh => super::tanh(x),
+            Activation::ReLU => super::relu(x),
+            Activation::LeakyReLU => super::leaky_relu(x),
         }
     }
 
@@ -233,10 +232,10 @@ impl Neuron {
     fn activation_derivative(&self, x: f32, output: f32) -> f32 {
         match self.activation {
             Activation::None => 1.0,
-            Activation::Sigmoid => crate::utils::sigmoid_derivative(output),
-            Activation::Tanh => crate::utils::tanh_derivative(output),
-            Activation::ReLU => crate::utils::relu_derivative(x),
-            Activation::LeakyReLU => crate::utils::leaky_relu_derivative(x),
+            Activation::Sigmoid => super::sigmoid_derivative(output),
+            Activation::Tanh => super::tanh_derivative(output),
+            Activation::ReLU => super::relu_derivative(x),
+            Activation::LeakyReLU => super::leaky_relu_derivative(x),
         }
     }
 }

@@ -21,18 +21,27 @@
 //! ```
 
 use crate::data::{
-    DataPreparer, FeatureStats, GenericRecord, ImageData, NormalizationMethod, Normalizer,
-    PatientData, TabularData, TemporalData, TemporalMeasurement, TextData, normalize_features,
+    FeatureStats, ImageData, NormalizationMethod, Normalizer, PatientData, PatientObservation,
+    PreparedRecord, TextData, migrations,
 };
-use crate::utils::error::{AppError, AppResult};
+use crate::data::source::ColumnMapping;
+use crate::error::{AppError, AppResult};
+use crate::models::PatientSequence;
 use csv::ReaderBuilder;
 use ndarray::Array3;
 use rand::Rng;
-use rusqlite::{Connection, Error as SQLError, params};
+use rusqlite::{Connection, params};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
+
+#[derive(Debug, Clone, Copy)]
+pub struct PreparedLoadOptions {
+    pub use_sequence: bool,
+    pub use_text: bool,
+    pub use_image: bool,
+}
 
 /// Database manager
 pub struct DatabaseManager {
@@ -40,9 +49,6 @@ pub struct DatabaseManager {
 }
 
 impl DatabaseManager {
-    /// Current schema version - increment when making schema changes
-    const SCHEMA_VERSION: i32 = 1;
-
     /// Open a connection to the SQLite database, creating it if it doesn't exist
     pub fn new<P: AsRef<Path>>(path: P) -> AppResult<Self> {
         let conn = Connection::open(path)?;
@@ -52,369 +58,589 @@ impl DatabaseManager {
             "PRAGMA foreign_keys = ON;
             PRAGMA journal_mode = WAL;
             PRAGMA synchronous = NORMAL;
-            PRAGMA cache_size = -64000;",
+            PRAGMA busy_timeout = 5000;",
         )?;
 
         let mut db = Self { conn };
-        db.init_schema()?;
-        db.run_migrations()?;
+        migrations::run(&mut db.conn)?;
+
         Ok(db)
     }
 
     /// Create an in-memory database (good for testing)
     pub fn in_memory() -> AppResult<Self> {
         let conn = Connection::open_in_memory()?;
+
+        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+
         let mut db = Self { conn };
-        db.init_schema()?;
+        migrations::run(&mut db.conn)?;
+
         Ok(db)
     }
 
-    /// Initialize the database schema
-    fn init_schema(&mut self) -> AppResult<()> {
+    /// Clear all data from the database while preserving its schema.
+    ///
+    /// Tables are discovered from SQLite metadata and deleted in dependency order, so this
+    /// continues to work when migrations add new tables with foreign keys.
+    pub fn clear_all_data(&mut self) -> AppResult<()> {
+        let tables = {
+            let mut statement = self.conn.prepare(
+                "SELECT name
+                 FROM sqlite_master
+                 WHERE type = 'table'
+                   AND name NOT LIKE 'sqlite_%'
+                   AND name != 'schema_migrations'",
+            )?;
+
+            statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+
+        let mut dependencies: HashMap<String, HashSet<String>> = tables
+            .iter()
+            .map(|table| (table.clone(), HashSet::new()))
+            .collect();
+
+        for table in &tables {
+            let escaped_table = table.replace('"', "\"\"");
+            let pragma = format!("PRAGMA foreign_key_list(\"{escaped_table}\")");
+            let mut statement = self.conn.prepare(&pragma)?;
+            let foreign_keys = statement.query_map([], |row| row.get::<_, String>(2))?;
+
+            for foreign_key in foreign_keys {
+                let parent = foreign_key?;
+                if dependencies.contains_key(&parent) {
+                    dependencies
+                        .get_mut(table)
+                        .expect("table was inserted into dependencies")
+                        .insert(parent);
+                }
+            }
+        }
+
+        let mut delete_order = Vec::with_capacity(tables.len());
+
+        while !dependencies.is_empty() {
+            let ready: Vec<String> = dependencies
+                .iter()
+                .filter(|(_, parents)| parents.is_empty())
+                .map(|(table, _)| table.clone())
+                .collect();
+
+            if ready.is_empty() {
+                return Err(AppError::InvalidData(
+                    "cannot clear database: tables contain a circular foreign-key dependency"
+                        .to_string(),
+                ));
+            }
+
+            for table in ready {
+                dependencies.remove(&table);
+                for parents in dependencies.values_mut() {
+                    parents.remove(&table);
+                }
+                delete_order.push(table);
+            }
+        }
+
         let tx = self.conn.transaction()?;
 
-        // 1. Main Patient Table
-        tx.execute(
-            "CREATE TABLE IF NOT EXISTS patients (
-                    patient_id TEXT PRIMARY KEY,
-                    age REAL,
-                    race TEXT,
-                    insurance TEXT,
-                    blood_pressure REAL,
-                    systolic_bp REAL,
-                    diastolic_bp REAL,
-                    glucose REAL,
-                    bmi REAL,
-                    pregnancies INTEGER,
-                    risk_level TEXT,
-                    has_complications BOOLEAN DEFAULT 0,
-                    risk_score REAL DEFAULT 0,
-                    existing_outcome REAL,
-                    cause_code INTEGER,
-                    image_count INTEGER DEFAULT 0,
-                    has_ultrasound BOOLEAN DEFAULT 0,
-                    dataset_source TEXT
-                )",
-            [],
-        )?;
-
-        // 2. Dynamic Features (for any additional columns)
-        tx.execute(
-            "CREATE TABLE IF NOT EXISTS patient_features (
-                    patient_id TEXT,
-                    feature_name TEXT,
-                    value REAL,
-                    PRIMARY KEY (patient_id, feature_name),
-                    FOREIGN KEY(patient_id) REFERENCES patients(patient_id) ON DELETE CASCADE
-                )",
-            [],
-        )?;
-        tx.execute(
-            "CREATE INDEX IF NOT EXISTS idx_patient_features ON patient_features(patient_id);",
-            [],
-        )?;
-
-        // 3. Temporal Measurements
-        tx.execute(
-            "CREATE TABLE IF NOT EXISTS temporal_measurements (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    patient_id TEXT,
-                    timestamp TEXT,
-                    measurement_type TEXT,
-                    value REAL,
-                    FOREIGN KEY(patient_id) REFERENCES patients(patient_id) ON DELETE CASCADE
-                )",
-            [],
-        )?;
-        tx.execute(
-            "CREATE INDEX IF NOT EXISTS idx_temporal_patient ON temporal_measurements(patient_id)",
-            [],
-        )?;
-
-        // 4. Clinical Notes
-        tx.execute(
-            "CREATE TABLE IF NOT EXISTS clinical_notes (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    patient_id TEXT,
-                    note_type TEXT,
-                    content TEXT,
-                    FOREIGN KEY(patient_id) REFERENCES patients(patient_id) ON DELETE CASCADE
-                )",
-            [],
-        )?;
-        tx.execute(
-            "CREATE INDEX IF NOT EXISTS idx_clinical_notes ON clinical_notes(patient_id);",
-            [],
-        )?;
-
-        // 5. Normalization parameters (persist for inference)
-        tx.execute(
-            "CREATE TABLE IF NOT EXISTS normalization_stats (
-                    feature_name TEXT PRIMARY KEY,
-                    mean REAL,
-                    std REAL,
-                    min REAL,
-                    max REAL,
-                    count INTEGER
-                )",
-            [],
-        )?;
-
-        // 6. Tabular data storage (for prepared data)
-        tx.execute(
-            "CREATE TABLE IF NOT EXISTS tabular_data (
-                    sample_id INTEGER PRIMARY KEY,
-                    patient_id TEXT,
-                    features BLOB
-                )",
-            [],
-        )?;
-
-        // 7. Tabular metadata
-        tx.execute(
-            "CREATE TABLE IF NOT EXISTS tabular_metadata (
-                    id INTEGER PRIMARY KEY,
-                    feature_names TEXT,
-                    feature_count INTEGER
-                )",
-            [],
-        )?;
-
-        // 8. Temporal sequences storage
-        tx.execute(
-            "CREATE TABLE IF NOT EXISTS temporal_sequences (
-                    sample_id INTEGER PRIMARY KEY,
-                    patient_id TEXT,
-                    sequence_data BLOB,
-                    seq_length INTEGER,
-                    feature_dim INTEGER
-                )",
-            [],
-        )?;
-
-        // 9. Temporal metadata
-        tx.execute(
-            "CREATE TABLE IF NOT EXISTS temporal_metadata (
-                    id INTEGER PRIMARY KEY,
-                    feature_names TEXT,
-                    max_seq_length INTEGER,
-                    feature_dim INTEGER
-                )",
-            [],
-        )?;
-
-        // 10. Text data storage
-        tx.execute(
-            "CREATE TABLE IF NOT EXISTS text_data (
-                    sample_id INTEGER PRIMARY KEY,
-                    patient_id TEXT,
-                    document TEXT,
-                    token_sequence BLOB
-                )",
-            [],
-        )?;
-
-        // 11. Text vocabulary
-        tx.execute(
-            "CREATE TABLE IF NOT EXISTS text_vocabulary (
-                    word TEXT PRIMARY KEY,
-                    idx INTEGER
-                )",
-            [],
-        )?;
-
-        // 12. Text metadata
-        tx.execute(
-            "CREATE TABLE IF NOT EXISTS text_metadata (
-                    id INTEGER PRIMARY KEY,
-                    vocab_size INTEGER,
-                    max_seq_length INTEGER
-                )",
-            [],
-        )?;
-
-        // 13. Image data storage (stores serialized arrays)
-        tx.execute(
-            "CREATE TABLE IF NOT EXISTS image_data (
-                    sample_id INTEGER PRIMARY KEY,
-                    patient_id TEXT,
-                    image_blob BLOB,
-                    channels INTEGER,
-                    height INTEGER,
-                    width INTEGER
-                )",
-            [],
-        )?;
-
-        // 14. Image metadata
-        tx.execute(
-            "CREATE TABLE IF NOT EXISTS image_metadata (
-                    id INTEGER PRIMARY KEY,
-                    channels INTEGER,
-                    height INTEGER,
-                    width INTEGER,
-                    channel_means TEXT,
-                    channel_stds TEXT
-                )",
-            [],
-        )?;
-
-        // 15. Outcomes storage
-        tx.execute(
-            "CREATE TABLE IF NOT EXISTS outcomes (
-                    sample_id INTEGER PRIMARY KEY,
-                    patient_id TEXT,
-                    mortality REAL,
-                    cause_code INTEGER
-                )",
-            [],
-        )?;
+        for table in delete_order.into_iter().rev() {
+            let quoted_table = table.replace('"', "\"\"");
+            let sql = format!("DELETE FROM \"{quoted_table}\"");
+            tx.execute(&sql, [])?;
+        }
 
         tx.commit()?;
+
+        info!("Cleared all prepared data");
+
         Ok(())
     }
 
-    /// Check and run migrations if needed
-    fn run_migrations(&mut self) -> AppResult<()> {
-        // Create version table if it doesn't exist
-        self.conn.execute(
-            "CREATE TABLE IF NOT EXISTS schema_version (
-                version INTEGER PRIMARY KEY,
-                applied_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )",
-            [],
-        )?;
+    pub fn load_prepared_records(
+        &self,
+        options: PreparedLoadOptions,
+    ) -> AppResult<Vec<PreparedRecord>> {
+        use std::collections::HashMap;
 
-        // Get current version
-        let current_version: i32 = self
-            .conn
-            .query_row(
-                "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+        let patient_ids =
+            self.load_training_patient_ids()?;
+
+        if patient_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let sequences =
+            if options.use_sequence {
+                self.load_sequences_by_patient()?
+            } else {
+                HashMap::new()
+            };
+
+        let text =
+            if options.use_text {
+                self.load_text_by_patient()?
+            } else {
+                HashMap::new()
+            };
+
+        let images =
+            if options.use_image {
+                self.load_images_by_patient()?
+            } else {
+                HashMap::new()
+            };
+
+        let outcomes =
+            self.load_outcomes_by_patient()?;
+
+        let mut records =
+            Vec::with_capacity(patient_ids.len());
+
+        for patient_id in patient_ids {
+            let sequence =
+                if options.use_sequence {
+                    sequences
+                        .get(&patient_id)
+                        .cloned()
+                        .ok_or_else(|| {
+                            AppError::InvalidData(format!(
+                                "Missing sequence for patient {}",
+                                patient_id
+                            ))
+                        })?
+                } else {
+                    PatientSequence {
+                        static_features: Vec::new(),
+                        dynamic_features: Vec::new(),
+                    }
+                };
+
+            let (target, cause_code) =
+                outcomes
+                    .get(&patient_id)
+                    .copied()
+                    .ok_or_else(|| {
+                        AppError::InvalidData(format!(
+                            "Missing outcome for patient {}",
+                            patient_id
+                        ))
+                    })?;
+
+            let images = if options.use_image {
+                images
+                    .get(&patient_id)
+                    .cloned()
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+
+            records.push(PreparedRecord {
+                patient_id: patient_id.clone(),
+                sequence,
+                text: text
+                    .get(&patient_id)
+                    .cloned()
+                    .unwrap_or_default(),
+                images,
+                target,
+                cause_code: Some(cause_code as u32),
+            });
+        }
+
+        Ok(records)
+    }
+
+    pub fn validate_prepared_data(
+        &self,
+        options: PreparedLoadOptions,
+    ) -> AppResult<()> {
+        let patient_count: i64 =
+            self.conn.query_row(
+                "SELECT COUNT(*) FROM patients",
                 [],
                 |row| row.get(0),
-            )
-            .unwrap_or(0);
+            )?;
 
-        // Run migrations
-        if current_version < Self::SCHEMA_VERSION {
-            info!(
-                "Running database migrations from version {} to {}",
-                current_version,
-                Self::SCHEMA_VERSION
+        let outcome_count: i64 =
+            self.conn.query_row(
+                "SELECT COUNT(DISTINCT patient_id)
+                 FROM outcomes",
+                [],
+                |row| row.get(0),
+            )?;
+
+        if patient_count == 0 {
+            return Err(AppError::InvalidData(
+                "No patients are stored".to_string(),
+            ));
+        }
+
+        if outcome_count == 0 {
+            return Err(AppError::InvalidData(
+                "No outcomes are stored".to_string(),
+            ));
+        }
+
+        if options.use_sequence {
+            let missing_sequences: i64 =
+                self.conn.query_row(
+                    "SELECT COUNT(*)
+                     FROM outcomes o
+                     LEFT JOIN patient_sequences s
+                       ON s.patient_id = o.patient_id
+                     WHERE s.patient_id IS NULL",
+                    [],
+                    |row| row.get(0),
+                )?;
+
+            if missing_sequences > 0 {
+                return Err(AppError::InvalidData(format!(
+                    "{} outcome patients have no sequence",
+                    missing_sequences
+                )));
+            }
+        }
+
+        if options.use_image {
+            let missing_images: i64 =
+                self.conn.query_row(
+                    "SELECT COUNT(*)
+                     FROM outcomes o
+                     LEFT JOIN image_data i
+                       ON i.patient_id = o.patient_id
+                     WHERE i.patient_id IS NULL",
+                    [],
+                    |row| row.get(0),
+                )?;
+
+            if missing_images > 0 {
+                return Err(AppError::InvalidData(format!(
+                    "{} outcome patients have no image",
+                    missing_images
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn load_training_patient_ids(
+        &self,
+    ) -> AppResult<Vec<String>> {
+        let mut statement = self.conn.prepare(
+            "SELECT patient_id
+             FROM outcomes
+             ORDER BY patient_id",
+        )?;
+
+        let patient_ids =
+            statement
+                .query_map([], |row| {
+                    row.get::<_, String>(0)
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(patient_ids)
+    }
+
+    fn load_sequences_by_patient(
+        &self,
+    ) -> AppResult<
+        std::collections::HashMap<
+            String,
+            PatientSequence,
+        >,
+    > {
+        use std::collections::HashMap;
+
+        let mut statement = self.conn.prepare(
+            "SELECT
+                patient_id,
+                static_features,
+                dynamic_features
+             FROM patient_sequences
+             ORDER BY patient_id",
+        )?;
+
+        let rows =
+            statement.query_map([], |row| {
+                let patient_id: String =
+                    row.get(0)?;
+
+                let static_blob: Vec<u8> =
+                    row.get(1)?;
+
+                let dynamic_blob: Vec<u8> =
+                    row.get(2)?;
+
+                Ok((
+                    patient_id,
+                    static_blob,
+                    dynamic_blob,
+                ))
+            })?;
+
+        let mut sequences =
+            HashMap::new();
+
+        for row in rows {
+            let (
+                patient_id,
+                static_blob,
+                dynamic_blob,
+            ) = row?;
+
+            let sequence =
+                PatientSequence {
+                    static_features:
+                        deserialize_f32_vec(&static_blob)?,
+                    dynamic_features:
+                        deserialize_dynamic_sequence(
+                            &dynamic_blob,
+                        )?,
+                };
+
+            if sequences
+                .insert(patient_id.clone(), sequence)
+                .is_some()
+            {
+                return Err(AppError::InvalidData(format!(
+                    "Duplicate stored sequence for patient {}",
+                    patient_id
+                )));
+            }
+        }
+
+        Ok(sequences)
+    }
+
+    fn load_text_by_patient(
+        &self,
+    ) -> AppResult<
+        std::collections::HashMap<
+            String,
+            Vec<usize>,
+        >,
+    > {
+        use std::collections::HashMap;
+
+        let mut statement = self.conn.prepare(
+            "SELECT patient_id, token_sequence
+             FROM text_data
+             ORDER BY patient_id",
+        )?;
+
+        let rows =
+            statement.query_map([], |row| {
+                let patient_id: String =
+                    row.get(0)?;
+
+                let tokens_blob: Vec<u8> =
+                    row.get(1)?;
+
+                Ok((patient_id, tokens_blob))
+            })?;
+
+        let mut text =
+            HashMap::new();
+
+        for row in rows {
+            let (patient_id, tokens_blob) =
+                row?;
+
+            let tokens =
+                deserialize_usize_vec(&tokens_blob)?;
+
+            if text
+                .insert(patient_id.clone(), tokens)
+                .is_some()
+            {
+                return Err(AppError::InvalidData(format!(
+                    "Duplicate text record for patient {}",
+                    patient_id
+                )));
+            }
+        }
+
+        Ok(text)
+    }
+
+    fn load_images_by_patient(
+        &self,
+    ) -> AppResult<
+        HashMap<String, Vec<Array3<f32>>>,
+    > {
+        let mut statement = self.conn.prepare(
+            "SELECT
+                patient_id,
+                image_blob,
+                channels,
+                height,
+                width
+             FROM image_data
+             ORDER BY patient_id, sample_id",
+        )?;
+
+        let rows =
+            statement.query_map([], |row| {
+                let patient_id: String = row.get(0)?;
+                let blob: Vec<u8> = row.get(1)?;
+                let channels: usize = row.get(2)?;
+                let height: usize = row.get(3)?;
+                let width: usize = row.get(4)?;
+
+                let image =
+                    deserialize_array3(
+                        &blob,
+                        channels,
+                        height,
+                        width,
+                    )
+                    .map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            1,
+                            rusqlite::types::Type::Blob,
+                            Box::new(error),
+                        )
+                    })?;
+
+                Ok((patient_id, image))
+            })?;
+
+        let mut images: HashMap<String, Vec<Array3<f32>>> = HashMap::new();
+
+        for row in rows {
+            let (patient_id, image) =
+                row?;
+
+            images
+                .entry(patient_id)
+                .or_default()
+                .push(image);
+        }
+
+        Ok(images)
+    }
+
+    fn load_outcomes_by_patient(
+        &self,
+    ) -> AppResult<
+        std::collections::HashMap<
+            String,
+            (f32, usize),
+        >,
+    > {
+        use std::collections::HashMap;
+
+        let mut statement = self.conn.prepare(
+            "SELECT patient_id, mortality, cause_code
+             FROM outcomes
+             ORDER BY patient_id",
+        )?;
+
+        let rows =
+            statement.query_map([], |row| {
+                let patient_id: String =
+                    row.get(0)?;
+
+                let target: f32 =
+                    row.get(1)?;
+
+                let cause_code: usize =
+                    row.get::<_, i64>(2)? as usize;
+
+                Ok((patient_id, target, cause_code))
+            })?;
+
+        let mut outcomes =
+            HashMap::new();
+
+        for row in rows {
+            let (
+                patient_id,
+                target,
+                cause_code,
+            ) = row?;
+
+            if outcomes
+                .insert(
+                    patient_id.clone(),
+                    (target, cause_code),
+                )
+                .is_some()
+            {
+                return Err(AppError::InvalidData(format!(
+                    "Duplicate outcome for patient {}",
+                    patient_id
+                )));
+            }
+        }
+
+        Ok(outcomes)
+    }
+
+    fn load_image_metadata(
+        &self,
+    ) -> AppResult<Option<(usize, usize, usize)>> {
+        let result =
+            self.conn.query_row(
+                "SELECT channels, height, width
+                 FROM image_metadata
+                 WHERE id = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                    ))
+                },
             );
 
-            for version in (current_version + 1)..=Self::SCHEMA_VERSION {
-                self.apply_migration(version)?;
+        match result {
+            Ok(metadata) => Ok(Some(metadata)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                Ok(None)
             }
+            Err(error) => Err(error.into()),
         }
-
-        Ok(())
-    }
-
-    /// Apply a specific migration version
-    fn apply_migration(&mut self, version: i32) -> AppResult<()> {
-        let tx = self.conn.transaction()?;
-
-        match version {
-            1 => {
-                // Initial schema - no migration needed
-                debug!("Migration 1: Initial schema");
-            }
-            2 => {
-                // Add new multi-modal data tables (already in init_schema for new DBs)
-                // tx.execute("ALTER TABLE patients ADD COLUMN new_field TEXT", [])?;
-                debug!("Migration 2: Added multi-modal data tables");
-            }
-            _ => {
-                warn!("Unknown migration version: {}", version);
-            }
-        }
-
-        tx.execute(
-            "INSERT OR REPLACE INTO schema_version (version) VALUES (?)",
-            params![version],
-        )?;
-        tx.commit()?;
-
-        Ok(())
-    }
-
-    /// Clear all data from the database (but keep schema)
-    pub fn clear_all_data(&mut self) -> AppResult<()> {
-        let tx = self.conn.transaction()?;
-
-        tx.execute("DELETE FROM outcomes", [])?;
-        tx.execute("DELETE FROM image_data", [])?;
-        tx.execute("DELETE FROM image_metadata", [])?;
-        tx.execute("DELETE FROM text_data", [])?;
-        tx.execute("DELETE FROM text_vocabulary", [])?;
-        tx.execute("DELETE FROM text_metadata", [])?;
-        tx.execute("DELETE FROM temporal_sequences", [])?;
-        tx.execute("DELETE FROM temporal_metadata", [])?;
-        tx.execute("DELETE FROM tabular_data", [])?;
-        tx.execute("DELETE FROM tabular_metadata", [])?;
-        tx.execute("DELETE FROM normalization_stats", [])?;
-        tx.execute("DELETE FROM clinical_notes", [])?;
-        tx.execute("DELETE FROM temporal_measurements", [])?;
-        tx.execute("DELETE FROM patient_features", [])?;
-        tx.execute("DELETE FROM patients", [])?;
-
-        tx.commit()?;
-        info!("Cleared all data from database");
-        Ok(())
     }
 
     // =========================================================================
     // Multi-Modal Data Storage
     // =========================================================================
 
-    /// Build TabularData from the patients and patient_features tables
-    pub fn build_tabular_data(&self) -> AppResult<TabularData> {
-        // Get all patient IDs in consistent order
-        let patient_ids: Vec<String> = self
+    /// Build unified static-plus-dynamic patient sequences from normalized tables.
+    ///
+    /// Static features are composed from:
+    /// - known columns in `patients`;
+    /// - additional values in `baseline_features`.
+    ///
+    /// Dynamic features are composed from:
+    /// - rows in `patient_observations`;
+    /// - one timestep per distinct observation timestamp.
+    ///
+    /// The returned vector is ordered by patient ID. Targets and all other
+    /// modalities must use this same ordering.
+    pub fn build_patient_sequences(&self) -> AppResult<Vec<(String, PatientSequence)>> {
+        use std::collections::BTreeMap;
+
+        let mut patient_ids: Vec<String> = self
             .conn
             .prepare("SELECT patient_id FROM patients ORDER BY patient_id")?
-            .query_map([], |row| row.get(0))?
-            .filter_map(|r| r.ok())
-            .collect();
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
 
         if patient_ids.is_empty() {
-            return Ok(TabularData::new());
+            return Ok(Vec::new());
         }
 
-        // Get all unique extra feature names
-        let extra_feature_names: Vec<String> = self
-            .conn
-            .prepare("SELECT DISTINCT feature_name FROM patient_features ORDER BY feature_name")?
-            .query_map([], |row| row.get(0))?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        // Filter out non-clinical features that should not be model inputs
-        let blacklisted: HashSet<&str> = [
-            "hadm_id",
-            "anchor_year",
-            "anchor_year_group",
-            "dod",
-            "subject_id",
-            "row_id",
-            "admittime",
-            "dischtime",
-            "deathtime",
-            "edregtime",
-            "edouttime",
-        ]
-        .iter()
-        .cloned()
-        .collect();
-
-        let extra_feature_names: Vec<String> = extra_feature_names
-            .into_iter()
-            .filter(|name| !blacklisted.contains(name.to_lowercase().replace(" ", "_").as_str()))
-            .collect();
-
-        // Build feature names list
-        let base_feature_names = vec![
+        let static_feature_names = vec![
             "age".to_string(),
             "systolic_bp".to_string(),
             "diastolic_bp".to_string(),
@@ -424,360 +650,350 @@ impl DatabaseManager {
             "has_complications".to_string(),
             "risk_score".to_string(),
         ];
-        let mut feature_names = base_feature_names;
-        feature_names.extend(extra_feature_names.clone());
 
-        // Build feature vectors for each patient
-        let mut data: Vec<Vec<f32>> = Vec::with_capacity(patient_ids.len());
-
-        for patient_id in &patient_ids {
-            // Get base patient data
-            let row: (Option<f32>, Option<f32>, Option<f32>, Option<f32>, Option<f32>, Option<i32>, bool, f32) = self
-                .conn
-                .query_row(
-                    "SELECT age, COALESCE(systolic_bp, blood_pressure), diastolic_bp, glucose, bmi, pregnancies, has_complications, risk_score
-                     FROM patients WHERE patient_id = ?",
-                    params![patient_id],
-                    |row| Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                        row.get(6)?,
-                        row.get(7)?,
-                    )),
-                )?;
-
-            let mut features = vec![
-                row.0.unwrap_or(0.0),
-                row.1.unwrap_or(0.0),
-                row.2.unwrap_or(0.0),
-                row.3.unwrap_or(0.0),
-                row.4.unwrap_or(0.0),
-                row.5.map(|p| p as f32).unwrap_or(0.0),
-                if row.6 { 1.0 } else { 0.0 },
-                row.7,
-            ];
-
-            // Get extra features
-            let extra_features: HashMap<String, f32> = self
-                .conn
-                .prepare("SELECT feature_name, value FROM patient_features WHERE patient_id = ?")?
-                .query_map(params![patient_id], |row| Ok((row.get(0)?, row.get(1)?)))?
-                .filter_map(|r| r.ok())
-                .collect();
-
-            // Add extra features in consistent order
-            for name in &extra_feature_names {
-                features.push(*extra_features.get(name).unwrap_or(&0.0));
-            }
-
-            data.push(features);
-        }
-
-        // Normalize features
-        normalize_features(&mut data);
-
-        info!(
-            "Built TabularData with {} samples, {} features",
-            data.len(),
-            feature_names.len()
-        );
-
-        Ok(TabularData {
-            data,
-            patient_ids,
-            feature_names,
-            numeric_stats: HashMap::new(),
-            categorical_mappings: HashMap::new(),
-            categorical_features: Vec::new(),
-            current_idx: 0,
-        })
-    }
-
-    /// Store tabular data in the database
-    pub fn store_tabular_data(&mut self, data: &TabularData) -> AppResult<()> {
-        // First, get all existing patient IDs from database
-        let existing_patient_ids: Vec<String> = self
-            .conn
-            .prepare("SELECT patient_id FROM patients ORDER BY rowid")?
-            .query_map([], |row| row.get(0))?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        let tx = self.conn.transaction()?;
-
-        // Clear existing tabular data
-        tx.execute("DELETE FROM tabular_data", [])?;
-        tx.execute("DELETE FROM tabular_metadata", [])?;
-
-        // Store metadata
-        let feature_names_json = serde_json::to_string(&data.feature_names).unwrap_or_default();
-        tx.execute(
-            "INSERT INTO tabular_metadata (id, feature_names, feature_count) VALUES (1, ?, ?)",
-            params![feature_names_json, data.feature_dim()],
-        )?;
-
-        // Store each sample
-        {
-            let mut stmt = tx.prepare(
-                "INSERT INTO tabular_data (sample_id, patient_id, features) VALUES (?, ?, ?)",
-            )?;
-
-            for (idx, features) in data.data.iter().enumerate() {
-                let features_blob = serialize_f32_vec(features);
-                // Use patient ID from TabularData, then from database, or generate one if not available
-                let patient_id = data
-                    .patient_ids
-                    .get(idx)
-                    .cloned()
-                    .or_else(|| existing_patient_ids.get(idx).cloned())
-                    .unwrap_or_else(|| format!("P{:02}", idx));
-                stmt.execute(params![idx as i64, patient_id, features_blob])?;
-            }
-        }
-
-        tx.commit()?;
-        info!("Stored {} tabular samples in database", data.data.len());
-        Ok(())
-    }
-
-    /// Load tabular data from the database
-    pub fn load_tabular_data(&self) -> AppResult<TabularData> {
-        // Load metadata
-        let (feature_names, feature_count): (String, usize) = self.conn.query_row(
-            "SELECT feature_names, feature_count FROM tabular_metadata WHERE id = 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-
-        let feature_names: Vec<String> = serde_json::from_str(&feature_names).unwrap_or_default();
-
-        // Load samples
-        let mut stmt = self
-            .conn
-            .prepare("SELECT features, patient_id FROM tabular_data ORDER BY sample_id")?;
-
-        let data: Vec<Vec<f32>> = stmt
-            .query_map([], |row| {
-                let blob: Vec<u8> = row.get(0)?;
-                Ok(deserialize_f32_vec(&blob))
-            })?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        let patient_ids: Vec<String> = stmt
-            .query_map([], |row| {
-                let patient_id: String = row.get(1)?;
-                Ok(patient_id)
-            })?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        info!("Loaded {} tabular samples from database", data.len());
-
-        Ok(TabularData {
-            data,
-            patient_ids,
-            feature_names,
-            numeric_stats: HashMap::new(),
-            categorical_mappings: HashMap::new(),
-            categorical_features: Vec::new(),
-            current_idx: 0,
-        })
-    }
-
-    /// Build TemporalData from the temporal_measurements table
-    /// Groups measurements by patient, sorted by timestamp
-    pub fn build_temporal_data(&self) -> AppResult<TemporalData> {
-        // Get all patient IDs that have temporal measurements
-        let patient_ids: Vec<String> = self
-            .conn
-            .prepare("SELECT DISTINCT patient_id FROM temporal_measurements ORDER BY patient_id")?
-            .query_map([], |row| row.get(0))?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        if patient_ids.is_empty() {
-            info!("No temporal measurements found in database");
-            return Ok(TemporalData::new());
-        }
-
-        // Get all unique measurement types (these become our features)
-        let measurement_types: Vec<String> = self
+        let extra_static_names: Vec<String> = self
             .conn
             .prepare(
-                "SELECT DISTINCT measurement_type FROM temporal_measurements ORDER BY measurement_type",
+                "SELECT DISTINCT feature_name
+                 FROM baseline_features
+                 ORDER BY feature_name",
             )?
-            .query_map([], |row| row.get(0))?
-            .filter_map(|r| r.ok())
-            .collect();
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
 
-        let num_features = measurement_types.len();
-        let type_to_idx: HashMap<String, usize> = measurement_types
+        let mut all_static_names = static_feature_names;
+        all_static_names.extend(extra_static_names);
+
+        let dynamic_feature_names: Vec<String> = self
+            .conn
+            .prepare(
+                "SELECT DISTINCT feature_name
+                 FROM patient_observations
+                 ORDER BY feature_name",
+            )?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let dynamic_feature_indices: HashMap<String, usize> = dynamic_feature_names
             .iter()
             .enumerate()
-            .map(|(i, t)| (t.clone(), i))
+            .map(|(index, name)| (name.clone(), index))
             .collect();
 
-        let mut sequences: Vec<Vec<Vec<f32>>> = Vec::with_capacity(patient_ids.len());
-        let mut max_seq_length: usize = 0;
+        #[derive(Default)]
+        struct PatientFeatures {
+            age: f32,
+            systolic_bp: f32,
+            diastolic_bp: f32,
+            glucose: f32,
+            bmi: f32,
+            pregnancies: f32,
+            has_complications: f32,
+            risk_score: f32,
+            extra: HashMap<String, f32>,
+            dynamic: BTreeMap<String, Vec<f32>>,
+        }
 
-        for patient_id in &patient_ids {
-            // Get all measurements for this patient, grouped by timestamp
-            let measurements: Vec<(String, String, f32)> = self
-                .conn
-                .prepare(
-                    "SELECT timestamp, measurement_type, value
-                     FROM temporal_measurements
-                     WHERE patient_id = ?
-                     ORDER BY timestamp",
-                )?
-                .query_map(params![patient_id], |row| {
-                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-                })?
-                .filter_map(|r| r.ok())
+        let mut features_by_patient: HashMap<String, PatientFeatures> = patient_ids
+            .iter()
+            .map(|id| (id.clone(), PatientFeatures::default()))
+            .collect();
+
+        // Load scalar patient features in one query.
+        {
+            let mut statement = self.conn.prepare(
+                "SELECT
+                    patient_id,
+                    age,
+                    systolic_bp,
+                    diastolic_bp,
+                    glucose,
+                    bmi,
+                    pregnancies,
+                    has_complications,
+                    risk_score
+                 FROM patients",
+            )?;
+
+            let rows = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<f32>>(1)?.unwrap_or_default(),
+                    row.get::<_, Option<f32>>(2)?.unwrap_or_default(),
+                    row.get::<_, Option<f32>>(3)?.unwrap_or_default(),
+                    row.get::<_, Option<f32>>(4)?.unwrap_or_default(),
+                    row.get::<_, Option<f32>>(5)?.unwrap_or_default(),
+                    row.get::<_, Option<u32>>(6)?.unwrap_or_default() as f32,
+                    if row.get::<_, bool>(7)? { 1.0 } else { 0.0 },
+                    row.get::<_, f32>(8)?,
+                ))
+            })?;
+
+            for row in rows {
+                let (
+                    patient_id,
+                    age,
+                    systolic_bp,
+                    diastolic_bp,
+                    glucose,
+                    bmi,
+                    pregnancies,
+                    has_complications,
+                    risk_score,
+                ) = row?;
+
+                if let Some(features) = features_by_patient.get_mut(&patient_id) {
+                    features.age = age;
+                    features.systolic_bp = systolic_bp;
+                    features.diastolic_bp = diastolic_bp;
+                    features.glucose = glucose;
+                    features.bmi = bmi;
+                    features.pregnancies = pregnancies;
+                    features.has_complications = has_complications;
+                    features.risk_score = risk_score;
+                }
+            }
+        }
+
+        // Load all baseline features in one query.
+        {
+            let mut statement = self.conn.prepare(
+                "SELECT patient_id, feature_name, value
+                 FROM baseline_features
+                 WHERE value IS NOT NULL",
+            )?;
+
+            let rows = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, f32>(2)?,
+                ))
+            })?;
+
+            for row in rows {
+                let (patient_id, feature_name, value) = row?;
+
+                if let Some(features) = features_by_patient.get_mut(&patient_id) {
+                    features.extra.insert(feature_name, value);
+                }
+            }
+        }
+
+        // Load all observations in one query, already ordered for efficient grouping.
+        if !dynamic_feature_names.is_empty() {
+            let mut statement = self.conn.prepare(
+                "SELECT patient_id, timestamp, feature_name, value
+                 FROM patient_observations
+                 WHERE value IS NOT NULL
+                 ORDER BY patient_id, timestamp, observation_id",
+            )?;
+
+            let rows = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, f32>(3)?,
+                ))
+            })?;
+
+            for row in rows {
+                let (patient_id, timestamp, feature_name, value) = row?;
+
+                let Some(&feature_index) = dynamic_feature_indices.get(&feature_name) else {
+                    continue;
+                };
+
+                let Some(features) = features_by_patient.get_mut(&patient_id) else {
+                    continue;
+                };
+
+                let timestep = features
+                    .dynamic
+                    .entry(timestamp)
+                    .or_insert_with(|| vec![0.0; dynamic_feature_names.len()]);
+
+                timestep[feature_index] = value;
+            }
+        }
+
+        let mut sequences: Vec<(String, PatientSequence)> = Vec::with_capacity(patient_ids.len());
+
+        for patient_id in patient_ids.drain(..) {
+            let features = features_by_patient
+            	.remove(&patient_id)
+            	.ok_or_else(|| {
+	                AppError::InvalidData(format!(
+	                    "patient '{}' was not found while building sequences",
+	                    patient_id
+	                ))
+             	})?;
+
+            let static_features = all_static_names
+                .iter()
+                .map(|name| match name.as_str() {
+                    "age" => features.age,
+                    "systolic_bp" => features.systolic_bp,
+                    "diastolic_bp" => features.diastolic_bp,
+                    "glucose" => features.glucose,
+                    "bmi" => features.bmi,
+                    "pregnancies" => features.pregnancies,
+                    "has_complications" => features.has_complications,
+                    "risk_score" => features.risk_score,
+                    _ => features.extra.get(name).copied().unwrap_or_default(),
+                })
                 .collect();
 
-            // Group by timestamp to create time steps
-            let mut timestamp_groups: Vec<(String, Vec<(String, f32)>)> = Vec::new();
-            for (ts, mtype, value) in measurements {
-                if let Some(last) = timestamp_groups.last_mut() {
-                    if last.0 == ts {
-                        last.1.push((mtype, value));
-                        continue;
-                    }
-                }
-                timestamp_groups.push((ts, vec![(mtype, value)]));
+            let mut dynamic_features: Vec<Vec<f32>> = features.dynamic.into_values().collect();
+
+            // Preserve the existing max-sequence behavior.
+            const MAX_SEQUENCE_LENGTH: usize = 512;
+
+            if dynamic_features.len() > MAX_SEQUENCE_LENGTH {
+                let start = dynamic_features.len() - MAX_SEQUENCE_LENGTH;
+                dynamic_features = dynamic_features.split_off(start);
             }
 
-            // Convert to feature vectors
-            let mut patient_sequence: Vec<Vec<f32>> = Vec::new();
-            for (_ts, group) in timestamp_groups {
-                let mut feature_vec = vec![0.0; num_features];
-                for (mtype, value) in group {
-                    if let Some(&idx) = type_to_idx.get(&mtype) {
-                        feature_vec[idx] = value;
-                    }
-                }
-                patient_sequence.push(feature_vec);
-            }
-
-            max_seq_length = max_seq_length.max(patient_sequence.len());
-            sequences.push(patient_sequence);
+            sequences.push((
+            	patient_id,
+             	PatientSequence {
+              		static_features,
+		            dynamic_features
+              	}
+            ));
         }
 
         info!(
-            "Built TemporalData with {} sequences, {} features, max length {}",
-            sequences.len(),
-            num_features,
-            max_seq_length
-        );
-
-        Ok(TemporalData {
-            sequences,
-            feature_names: measurement_types,
-            feature_stats: HashMap::new(),
-            max_seq_length,
-            current_idx: 0,
-        })
-    }
-
-    /// Store temporal data in the database
-    pub fn store_temporal_data(&mut self, data: &TemporalData) -> AppResult<()> {
-        let tx = self.conn.transaction()?;
-
-        // Clear existing temporal data
-        tx.execute("DELETE FROM temporal_sequences", [])?;
-        tx.execute("DELETE FROM temporal_metadata", [])?;
-
-        // Store metadata
-        let feature_names_json = serde_json::to_string(&data.feature_names).unwrap_or_default();
-        tx.execute(
-                "INSERT INTO temporal_metadata (id, feature_names, max_seq_length, feature_dim) VALUES (1, ?, ?, ?)",
-                params![feature_names_json, data.max_seq_length, data.feature_dim()],
-            )?;
-
-        // Store each sequence
-        {
-            let mut stmt = tx.prepare(
-                    "INSERT INTO temporal_sequences (sample_id, patient_id, sequence_data, seq_length, feature_dim) VALUES (?, ?, ?, ?, ?)",
-                )?;
-
-            for (idx, sequence) in data.sequences.iter().enumerate() {
-                let sequence_blob = serialize_temporal_sequence(sequence);
-                let patient_id = format!("P{:02}", idx);
-                let seq_length = sequence.len();
-                let feature_dim = if sequence.is_empty() {
-                    0
-                } else {
-                    sequence[0].len()
-                };
-                stmt.execute(params![
-                    idx as i64,
-                    patient_id,
-                    sequence_blob,
-                    seq_length,
-                    feature_dim
-                ])?;
-            }
-        }
-
-        tx.commit()?;
-        info!(
-            "Stored {} temporal sequences in database",
-            data.sequences.len()
-        );
-        Ok(())
-    }
-
-    /// Load temporal data from the database
-    pub fn load_temporal_data(&self) -> AppResult<TemporalData> {
-        // Load metadata
-        let (feature_names_json, max_seq_length, feature_dim): (String, usize, usize) = self
-            .conn
-            .query_row(
-            "SELECT feature_names, max_seq_length, feature_dim FROM temporal_metadata WHERE id = 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )?;
-
-        let feature_names: Vec<String> =
-            serde_json::from_str(&feature_names_json).unwrap_or_default();
-
-        // Load sequences
-        let mut stmt = self.conn.prepare(
-                "SELECT sequence_data, seq_length, feature_dim FROM temporal_sequences ORDER BY sample_id",
-            )?;
-
-        let sequences: Vec<Vec<Vec<f32>>> = stmt
-            .query_map([], |row| {
-                let blob: Vec<u8> = row.get(0)?;
-                let seq_length: usize = row.get(1)?;
-                let feature_dim: usize = row.get(2)?;
-                Ok(deserialize_temporal_sequence(
-                    &blob,
-                    seq_length,
-                    feature_dim,
-                ))
-            })?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        info!(
-            "Loaded {} temporal sequences from database",
+            "Built {} patient sequences using bulk database reads",
             sequences.len()
         );
 
-        Ok(TemporalData {
-            sequences,
-            feature_names,
-            feature_stats: HashMap::new(),
-            max_seq_length,
-            current_idx: 0,
-        })
+        Ok(sequences)
+    }
+
+    pub fn store_patient_sequences(
+        &mut self,
+        sequences: &[(String, PatientSequence)],
+    ) -> AppResult<()> {
+        let tx = self.conn.transaction()?;
+
+        tx.execute(
+            "DELETE FROM patient_sequences",
+            [],
+        )?;
+
+        let mut statement = tx.prepare(
+            "INSERT INTO patient_sequences (
+                sample_id,
+                patient_id,
+                static_features,
+                dynamic_features,
+                static_feature_count,
+                dynamic_feature_count,
+                sequence_length
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )?;
+
+        for (sample_id, (patient_id, sequence))
+            in sequences.iter().enumerate()
+        {
+            let static_blob =
+                serialize_f32_vec(
+                    &sequence.static_features,
+                );
+
+            let dynamic_blob =
+                serialize_dynamic_sequence(
+                    &sequence.dynamic_features,
+                );
+
+            let dynamic_feature_count =
+                sequence
+                    .dynamic_features
+                    .first()
+                    .map(Vec::len)
+                    .unwrap_or(0);
+
+            statement.execute(params![
+                sample_id as i64,
+                patient_id,
+                static_blob,
+                dynamic_blob,
+                sequence.static_features.len() as i64,
+                dynamic_feature_count as i64,
+                sequence.dynamic_features.len() as i64,
+            ])?;
+        }
+
+        drop(statement);
+        tx.commit()?;
+
+        Ok(())
+    }
+
+    /// Record where a normalized dataset came from for reproducibility and audit.
+    pub fn record_ingestion_run(
+        &self,
+        source_type: &str,
+        source_identifier: &str,
+        record_count: usize,
+    ) -> AppResult<()> {
+        self.conn.execute(
+            "INSERT INTO ingestion_runs (source_type, source_identifier, retrieved_at, record_count)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![source_type, source_identifier, chrono::Utc::now().to_rfc3339(), record_count as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Store or replace one patient's unified sequence.
+    pub fn store_fhir_patient_sequence(
+        &mut self,
+        patient_id: &str,
+        sequence: &PatientSequence,
+    ) -> AppResult<()> {
+        let tx = self.conn.transaction()?;
+        let static_blob = serialize_f32_vec(&sequence.static_features);
+        let dynamic_blob = serialize_dynamic_sequence(&sequence.dynamic_features);
+        let dynamic_feature_count = sequence
+            .dynamic_features
+            .first()
+            .map(|timestep| timestep.len())
+            .unwrap_or(0);
+
+        tx.execute(
+            "INSERT INTO patient_sequences (
+                sample_id,
+                patient_id,
+                static_features,
+                dynamic_features,
+                static_feature_count,
+                dynamic_feature_count,
+                sequence_length
+            ) VALUES (
+                (SELECT COALESCE(MAX(sample_id), -1) + 1 FROM patient_sequences),
+                ?, ?, ?, ?, ?, ?
+            )
+            ON CONFLICT(patient_id) DO UPDATE SET
+                static_features = excluded.static_features,
+                dynamic_features = excluded.dynamic_features,
+                static_feature_count = excluded.static_feature_count,
+                dynamic_feature_count = excluded.dynamic_feature_count,
+                sequence_length = excluded.sequence_length",
+            params![
+                patient_id,
+                static_blob,
+                dynamic_blob,
+                sequence.static_features.len() as i64,
+                dynamic_feature_count as i64,
+                sequence.dynamic_features.len() as i64,
+            ],
+        )?;
+
+        tx.commit()?;
+        Ok(())
     }
 
     /// Build TextData from the clinical_notes table
@@ -786,7 +1002,14 @@ impl DatabaseManager {
         // Get all clinical notes
         let notes: Vec<(String, String)> = self
             .conn
-            .prepare("SELECT patient_id, content FROM clinical_notes ORDER BY patient_id, id")?
+            .prepare(
+                "SELECT clinical_notes.patient_id, clinical_notes.content
+                 FROM clinical_notes
+                 INNER JOIN patients ON patients.patient_id = clinical_notes.patient_id
+                 WHERE clinical_notes.content IS NOT NULL
+                   AND trim(clinical_notes.content) <> ''
+                 ORDER BY clinical_notes.patient_id, clinical_notes.id",
+            )?
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
             .filter_map(|r| r.ok())
             .collect();
@@ -875,6 +1098,7 @@ impl DatabaseManager {
         );
 
         Ok(TextData {
+            patient_ids: patient_ids.clone(),
             documents,
             token_sequences,
             vocab,
@@ -910,77 +1134,44 @@ impl DatabaseManager {
         // Store documents and token sequences
         {
             let mut stmt = tx.prepare(
-                    "INSERT INTO text_data (sample_id, patient_id, document, token_sequence) VALUES (?, ?, ?, ?)",
-                )?;
+                "INSERT INTO text_data (
+                    sample_id,
+                    patient_id,
+                    document,
+                    token_sequence
+                )
+                SELECT ?1, ?2, ?3, ?4
+                ON CONFLICT(patient_id) DO UPDATE SET
+                    sample_id = excluded.sample_id,
+                    document = excluded.document,
+                    token_sequence = excluded.token_sequence",
+            )?;
 
-            for (idx, (doc, tokens)) in data
-                .documents
+            if data.patient_ids.len() != data.documents.len()
+                || data.documents.len() != data.token_sequences.len()
+            {
+                return Err(AppError::InvalidData(
+                    "text patient IDs, documents, and token sequences are misaligned".to_string(),
+                ));
+            }
+
+            for (idx, ((patient_id, doc), tokens)) in data
+                .patient_ids
                 .iter()
+                .zip(data.documents.iter())
                 .zip(data.token_sequences.iter())
                 .enumerate()
             {
                 let tokens_blob = serialize_usize_vec(tokens);
-                let patient_id = format!("P{:02}", idx);
+
                 stmt.execute(params![idx as i64, patient_id, doc, tokens_blob])?;
             }
         }
 
         tx.commit()?;
         info!("Stored {} text documents in database", data.documents.len());
+
         Ok(())
-    }
-
-    /// Load text data from the database
-    pub fn load_text_data(&self) -> AppResult<TextData> {
-        // Load metadata
-        let (vocab_size, max_seq_length): (usize, usize) = self.conn.query_row(
-            "SELECT vocab_size, max_seq_length FROM text_metadata WHERE id = 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-
-        // Load vocabulary
-        let mut stmt = self.conn.prepare("SELECT word, idx FROM text_vocabulary")?;
-        let vocab: HashMap<String, usize> = stmt
-            .query_map([], |row| {
-                let word: String = row.get(0)?;
-                let idx: i64 = row.get(1)?;
-                Ok((word, idx as usize))
-            })?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        let reverse_vocab: HashMap<usize, String> =
-            vocab.iter().map(|(k, v)| (*v, k.clone())).collect();
-
-        // Load documents and token sequences
-        let mut stmt = self
-            .conn
-            .prepare("SELECT document, token_sequence FROM text_data ORDER BY sample_id")?;
-
-        let mut documents = Vec::new();
-        let mut token_sequences = Vec::new();
-
-        let rows: Vec<(String, Vec<u8>)> = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        for (doc, tokens_blob) in rows {
-            documents.push(doc);
-            token_sequences.push(deserialize_usize_vec(&tokens_blob));
-        }
-
-        info!("Loaded {} text documents from database", documents.len());
-
-        Ok(TextData {
-            documents,
-            token_sequences,
-            vocab,
-            reverse_vocab,
-            max_seq_length,
-            current_idx: 0,
-        })
     }
 
     /// Build ImageData from image files referenced in the patients table
@@ -991,38 +1182,37 @@ impl DatabaseManager {
         target_size: (usize, usize),
         grayscale: bool,
     ) -> AppResult<ImageData> {
+        let image_dir = image_dir.as_ref();
+        let image_config = crate::data::source::ImageRoot {
+            path: image_dir.display().to_string(),
+            patient_id_pattern: None,
+            patient_id_depth: Some(1),
+        };
+        let records = crate::data::source::discover_associated_images(image_dir, &image_config)?;
+        self.build_image_data_for_records(&records, target_size, grayscale)
+    }
+
+    pub fn build_image_data_for_records(
+        &self,
+        records: &[(String, PathBuf)],
+        target_size: (usize, usize),
+        grayscale: bool,
+    ) -> AppResult<ImageData> {
         use std::fs;
 
-        let image_dir = image_dir.as_ref();
-        if !image_dir.exists() {
-            info!("Image directory not found: {:?}", image_dir);
+        if records.is_empty() {
+            info!("No associated image files found");
             return Ok(ImageData::new());
         }
 
-        // Find all image files recursively
-        let image_extensions = ["jpg", "jpeg", "png", "bmp", "gif"];
-        let mut image_paths: Vec<PathBuf> = Vec::new();
-
-        fn find_images(dir: &Path, extensions: &[&str], paths: &mut Vec<PathBuf>) {
-            if let Ok(entries) = fs::read_dir(dir) {
-                for entry in entries.filter_map(|e| e.ok()) {
-                    let path = entry.path();
-                    if path.is_dir() {
-                        find_images(&path, extensions, paths);
-                    } else if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
-                        if extensions.iter().any(|&e| e.eq_ignore_ascii_case(ext)) {
-                            paths.push(path);
-                        }
-                    }
-                }
-            }
-        }
-
-        find_images(image_dir, &image_extensions, &mut image_paths);
-        image_paths.sort();
+        let image_paths: Vec<PathBuf> = records.iter().map(|(_, path)| path.clone()).collect();
+        let patient_ids: Vec<String> = records
+            .iter()
+            .map(|(patient_id, _)| patient_id.clone())
+            .collect();
 
         if image_paths.is_empty() {
-            info!("No image files found in {:?}", image_dir);
+            info!("No associated image files found");
             return Ok(ImageData::new());
         }
 
@@ -1113,6 +1303,7 @@ impl DatabaseManager {
 
         Ok(ImageData {
             images,
+            patient_ids,
             image_size: target_size,
             channels,
             channel_means,
@@ -1145,7 +1336,15 @@ impl DatabaseManager {
 
             for (idx, image) in data.images.iter().enumerate() {
                 let image_blob = serialize_array3(image);
-                let patient_id = format!("P{:02}", idx);
+                let patient_id = data
+                    .patient_ids
+                    .get(idx)
+                    .filter(|id| !id.is_empty())
+                    .ok_or_else(|| {
+                        AppError::InvalidData(format!(
+                            "Missing patient association for image {idx}"
+                        ))
+                    })?;
                 stmt.execute(params![
                     idx as i64,
                     patient_id,
@@ -1162,52 +1361,11 @@ impl DatabaseManager {
         Ok(())
     }
 
-    /// Load image data from the database
-    pub fn load_image_data(&self) -> AppResult<ImageData> {
-        // Load metadata
-        let (channels, height, width, channel_means_json, channel_stds_json): (usize, usize, usize, String, String) =
-                self.conn.query_row(
-                    "SELECT channels, height, width, channel_means, channel_stds FROM image_metadata WHERE id = 1",
-                    [],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
-                )?;
-
-        let channel_means: Vec<f32> = serde_json::from_str(&channel_means_json).unwrap_or_default();
-        let channel_stds: Vec<f32> = serde_json::from_str(&channel_stds_json).unwrap_or_default();
-
-        // Load images
-        let mut stmt = self.conn.prepare(
-            "SELECT image_blob, channels, height, width FROM image_data ORDER BY sample_id",
-        )?;
-
-        let images: Vec<Array3<f32>> = stmt
-            .query_map([], |row| {
-                let blob: Vec<u8> = row.get(0)?;
-                let c: usize = row.get(1)?;
-                let h: usize = row.get(2)?;
-                let w: usize = row.get(3)?;
-                Ok(deserialize_array3(&blob, c, h, w))
-            })?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        info!("Loaded {} images from database", images.len());
-
-        Ok(ImageData {
-            images,
-            image_size: (height, width),
-            channels,
-            channel_means,
-            channel_stds,
-            current_idx: 0,
-        })
-    }
-
     /// Build outcomes from the patients table
     /// Returns (targets, causes) vectors aligned with patient order
     /// Uses existing_outcome as the target, and derives cause_code from risk_level
     pub fn build_outcomes(&self) -> AppResult<(Vec<f32>, Vec<usize>)> {
-        // Get all patients in consistent order (same order as build_tabular_data)
+        // Get all patients in consistent order
         let rows: Vec<(String, Option<f32>, Option<i32>, Option<String>)> = self
 	        .conn
 	        .prepare(
@@ -1292,12 +1450,24 @@ impl DatabaseManager {
 
     /// Store outcomes in the database
     pub fn store_outcomes(&mut self, targets: &[f32], causes: &[usize]) -> AppResult<()> {
+        if targets.len() != causes.len() {
+            return Err(AppError::InvalidData(
+                "Outcome and cause counts must match".to_string(),
+            ));
+        }
+
         let patient_ids: Vec<String> = self
             .conn
             .prepare("SELECT patient_id FROM patients ORDER BY patient_id")?
             .query_map([], |row| row.get(0))?
             .filter_map(|r| r.ok())
             .collect();
+
+        if patient_ids.len() < targets.len() {
+            return Err(AppError::InvalidData(
+                "Outcome count exceeds patient count".to_string(),
+            ));
+        }
 
         let tx = self.conn.transaction()?;
 
@@ -1307,78 +1477,58 @@ impl DatabaseManager {
         // Store each outcome
         {
             let mut stmt = tx.prepare(
-                    "INSERT INTO outcomes (sample_id, patient_id, mortality, cause_code) VALUES (?, ?, ?, ?)",
-                )?;
+                "INSERT INTO outcomes (patient_id, mortality, cause_code) VALUES (?, ?, ?)",
+            )?;
 
             for (idx, (target, cause)) in targets.iter().zip(causes.iter()).enumerate() {
-                let patient_id = patient_ids
-                    .get(idx)
-                    .cloned()
-                    .unwrap_or_else(|| format!("P{:02}", idx));
-                stmt.execute(params![idx as i64, patient_id, *target, *cause as i64])?;
+                let patient_id = &patient_ids[idx];
+                stmt.execute(params![patient_id, *target, *cause as i64])?;
             }
         }
 
         tx.commit()?;
+
         info!("Stored {} outcomes in database", targets.len());
+
         Ok(())
     }
 
-    /// Load outcomes from the database
-    pub fn load_outcomes(&self) -> AppResult<(Vec<f32>, Vec<usize>)> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT mortality, cause_code FROM outcomes ORDER BY sample_id")?;
+    pub fn get_sample_counts(
+        &self,
+    ) -> AppResult<SampleCounts> {
+        let sequences: i64 =
+            self.conn.query_row(
+                "SELECT COUNT(*) FROM patient_sequences",
+                [],
+                |row| row.get(0),
+            )?;
 
-        let mut targets = Vec::new();
-        let mut causes = Vec::new();
+        let text: i64 =
+            self.conn.query_row(
+                "SELECT COUNT(DISTINCT patient_id)
+                 FROM text_data",
+                [],
+                |row| row.get(0),
+            )?;
 
-        let rows: Vec<(f32, i64)> = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .filter_map(|r| r.ok())
-            .collect();
+        let image: i64 =
+            self.conn.query_row(
+                "SELECT COUNT(DISTINCT patient_id)
+                 FROM image_data",
+                [],
+                |row| row.get(0),
+            )?;
 
-        for (mortality, cause) in rows {
-            targets.push(mortality);
-            causes.push(cause as usize);
-        }
+        let outcomes: i64 =
+            self.conn.query_row(
+                "SELECT COUNT(DISTINCT patient_id)
+                 FROM outcomes",
+                [],
+                |row| row.get(0),
+            )?;
 
-        info!("Loaded {} outcomes from database", targets.len());
-        Ok((targets, causes))
-    }
-
-    /// Get the count of samples for each modality
-    pub fn get_sample_counts(&self) -> AppResult<ModalityCounts> {
-        let tabular: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM tabular_data", [], |row| row.get(0))
-            .unwrap_or(0);
-
-        let temporal: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM temporal_sequences", [], |row| {
-                row.get(0)
-            })
-            .unwrap_or(0);
-
-        let text: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM text_data", [], |row| row.get(0))
-            .unwrap_or(0);
-
-        let image: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM image_data", [], |row| row.get(0))
-            .unwrap_or(0);
-
-        let outcomes: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM outcomes", [], |row| row.get(0))
-            .unwrap_or(0);
-
-        Ok(ModalityCounts {
-            tabular: tabular as usize,
-            temporal: temporal as usize,
+        Ok(SampleCounts {
+            sequences: sequences as usize,
             text: text as usize,
             image: image as usize,
             outcomes: outcomes as usize,
@@ -1394,352 +1544,366 @@ impl DatabaseManager {
     /// # Arguments
     /// * `path` - Path to the CSV file
     /// * `patient_id_column` - Name of the column containing patient IDs
-    /// * `dataset_source` - Optional label for the data source (e.g., "MIMIC-IV")
+    /// Import a CSV using the built-in column heuristics.
+    ///
+    /// This compatibility wrapper preserves the original public API. Use
+    /// `import_csv_with_mapping` when a manifest declares source semantics.
     pub fn import_csv<P: AsRef<Path>>(
         &mut self,
         path: P,
         patient_id_column: &str,
         dataset_source: Option<&str>,
     ) -> AppResult<usize> {
-        let file = File::open(&path).map_err(|e| AppError::Io(e))?;
-        let mut preparer = DataPreparer::new();
+        self.import_csv_with_mapping(path, patient_id_column, dataset_source, None)
+    }
 
-        let mut reader = ReaderBuilder::new().flexible(true).from_reader(file);
+    /// Import a CSV file using an optional manifest-declared semantic mapping.
+    ///
+    /// * `path` - Path to the CSV file
+    /// * `patient_id_column` - Fallback name of the patient ID column
+    /// * `dataset_source` - Optional label for the data source (e.g., "MIMIC-IV")
+    /// * `mapping` - Optional manifest-declared semantic column mapping
+    pub fn import_csv_with_mapping<P: AsRef<Path>>(
+        &mut self,
+        path: P,
+        patient_id_column: &str,
+        dataset_source: Option<&str>,
+        mapping: Option<&ColumnMapping>,
+    ) -> AppResult<usize> {
+        let path = path.as_ref();
 
-        let headers: Vec<String> = reader.headers()?.iter().map(|h| h.to_string()).collect();
+        let file = File::open(path)?;
+        let mut reader = ReaderBuilder::new()
+            .flexible(true)
+            .from_reader(file);
 
-        // Find patient ID and timestamp column index
-        let id_col_idx = headers.iter().position(|h| {
-            let h_lower = h.to_lowercase();
-            h_lower.contains("patient")
-                || h_lower.contains("subject")
-                // || h_lower == "id"
-                || h.eq_ignore_ascii_case(patient_id_column)
-        });
+        let headers = reader
+            .headers()?
+            .iter()
+            .map(str::trim)
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
 
-        let timestamp_col_idx = headers.iter().position(|h| {
-            let h_lower = h.to_lowercase();
-            h_lower.contains("timestamp") || h_lower.contains("datetime")
-        });
-
-        let note_col_idx = headers.iter().position(|h| {
-            let h_lower = h.to_lowercase();
-            h_lower.contains("note")
-                || h_lower.contains("comment")
-                || h_lower.contains("description")
-                || h_lower.contains("text")
-        });
-
-        let note_type_col_idx = headers.iter().position(|h| {
-            let h_lower = h.to_lowercase();
-            h_lower.contains("type") || h_lower.contains("category") || h_lower.contains("kind")
-        });
-
-        let is_temporal = timestamp_col_idx.is_some();
-        let is_text = note_col_idx.is_some();
-
-        // Known column mappings (case-insensitive)
-        let known_columns: HashMap<&str, &str> = [
-            ("age", "age"),
-            ("anchor_age", "age"),
-            ("race", "race"),
-            ("insurance", "insurance"),
-            ("bloodpressure", "blood_pressure"),
-            ("bp", "blood_pressure"),
-            ("systolicbp", "systolic_bp"),
-            ("systolic_bp", "systolic_bp"),
-            ("diastolicbp", "diastolic_bp"),
-            ("diastolic_bp", "diastolic_bp"),
-            ("glucose", "glucose"),
-            ("bs", "glucose"),
-            ("blood_sugar", "glucose"),
-            ("bmi", "bmi"),
-            ("bodymassindex", "bmi"),
-            ("pregnancies", "pregnancies"),
-            ("gravida", "pregnancies"),
-            ("risklevel", "risk_level"),
-            ("risk_level", "risk_level"),
-            ("outcome", "existing_outcome"),
-            ("mortality", "existing_outcome"),
-            ("hospital_expire_flag", "existing_outcome"),
-            ("causecode", "cause_code"),
-            ("cause_code", "cause_code"),
-            ("cause", "cause_code"),
-        ]
-        .iter()
-        .cloned()
-        .collect();
-
-        // Columns that should NEVER be used as model features.
-        // These are identifiers, administrative data, or target-leaking fields.
-        let feature_blacklist: HashSet<&str> = [
-            "hadm_id",              // Hospital admission ID — pure identifier
-            "anchor_year",          // MIMIC shifted calendar year — not clinical
-            "anchor_year_group",    // MIMIC year group — not clinical
-            "dod",                  // Date of death — target leakage!
-            "subject_id",           // Patient ID duplicate
-            "row_id",               // Database row ID
-            "admittime",            // Administrative timestamp
-            "dischtime",            // Administrative timestamp
-            "deathtime",            // Target leakage!
-            "edregtime",            // ED registration time
-            "edouttime",            // ED out time
-            "hospital_expire_flag", // Already mapped as known column
-            "expire_flag",          // Target leakage
-        ]
-        .iter()
-        .cloned()
-        .collect();
-
-        // For temporal data, identify measurement columns
-        let measurement_cols: Vec<(usize, String)> = if is_temporal {
-            headers
-                .iter()
-                .enumerate()
-                .filter(|(i, h)| {
-                    Some(*i) != id_col_idx
-                        && Some(*i) != timestamp_col_idx
-                        && !known_columns.contains_key(&h.to_lowercase().replace(" ", "_").as_str())
-                })
-                .map(|(i, name)| (i, name.clone()))
-                .collect()
-        } else {
-            Vec::new()
-        };
-
-        // ---------------------------------------------------------
-        // PRE-COMPUTE COLUMN ACTIONS (Do this ONCE per file)
-        // ---------------------------------------------------------
-        enum ColAction {
-            Skip,
-            Gender,
-            Known(&'static str),
-            Extra(String),
+        if headers.is_empty() {
+            return Err(AppError::InvalidData(format!(
+                "CSV file has no headers: {}",
+                path.display()
+            )));
         }
 
-        let mut col_actions: Vec<ColAction> = Vec::with_capacity(headers.len());
+        let id_column_index = find_patient_id_column(
+            &headers,
+            mapping
+                .and_then(|value| value.patient_id_column.as_deref())
+                .unwrap_or(patient_id_column),
+        );
 
-        for (i, col_name) in headers.iter().enumerate() {
-            if Some(i) == id_col_idx {
-                col_actions.push(ColAction::Skip);
-                continue;
-            }
-
-            let col_lower = col_name.to_lowercase().replace(" ", "_");
-
-            if col_lower == "gender" || col_lower == "sex" {
-                col_actions.push(ColAction::Gender);
-            } else if let Some(&field_name) = known_columns.get(col_lower.as_str()) {
-                col_actions.push(ColAction::Known(field_name));
-            } else if feature_blacklist.contains(col_lower.as_str()) {
-                col_actions.push(ColAction::Skip);
-            } else {
-                col_actions.push(ColAction::Extra(col_name.clone()));
-            }
-        }
-
-        // ---------------------------------------------------------
-        // FAST ROW PROCESSING
-        // ---------------------------------------------------------
-        const BATCH_SIZE: usize = 10_000;
-        let mut batch: Vec<PatientData> = Vec::with_capacity(BATCH_SIZE);
-        let mut total_count: usize = 0;
-
-        for result in reader.records() {
-            let record = result?;
-            let mut skip_patient = false;
-
-            let patient_id = match id_col_idx {
-                Some(idx) => {
-                    let id = record.get(idx).unwrap_or("").trim().to_string();
-                    if id.is_empty() {
-                        preparer.generate_patient_id()
-                    } else {
-                        id
-                    }
+        let timestamp_column_index = mapping
+            .and_then(|value| value.timestamp_column.as_deref())
+            .and_then(|column| find_column(&headers, column))
+            .or_else(|| {
+                if mapping
+                    .map(|value| value.disable_timestamp_detection)
+                    .unwrap_or(false)
+                {
+                    None
+                } else {
+                    headers.iter().position(|header| {
+                        matches!(normalize_column_name(header).as_str(),
+                            "timestamp" | "datetime" | "date_time" |
+                            "effective_date_time" | "observation_time" |
+                            "charttime" | "storetime" | "admittime" |
+                            "dischtime" | "intime" | "outtime")
+                    })
                 }
-                None => preparer.generate_patient_id(),
+            });
+
+        let note_column_index = mapping
+            .and_then(|value| value.note_column.as_deref())
+            .and_then(|column| find_column(&headers, column))
+            .or_else(|| {
+                headers.iter().position(|header| {
+                    let normalized = normalize_column_name(header);
+                    normalized.contains("note")
+                        || normalized.contains("comment")
+                        || normalized.contains("description")
+                        || normalized == "text"
+                        || normalized == "clinical_note"
+                })
+            });
+
+        let note_type_column_index = mapping
+            .and_then(|value| value.note_type_column.as_deref())
+            .and_then(|column| find_column(&headers, column))
+            .or_else(|| {
+                headers.iter().position(|header| {
+                    matches!(normalize_column_name(header).as_str(),
+                        "note_type" | "note_category" | "note_kind")
+                })
+            });
+
+        let has_timestamp =
+            timestamp_column_index.is_some();
+
+        let has_notes =
+            note_column_index.is_some();
+
+        let known_columns =
+            known_column_mappings();
+
+        let feature_blacklist =
+            feature_blacklist();
+
+        let outcome_column = mapping
+            .and_then(|value| value.outcome_column.as_deref())
+            .and_then(|column| find_column(&headers, column));
+
+        let mut ignored_columns = mapping
+            .map(|value| {
+                value
+                    .ignored_columns
+                    .iter()
+                    .filter_map(|column| find_column(&headers, column))
+                    .collect::<HashSet<_>>()
+            })
+            .unwrap_or_default();
+
+        let long_form_event = build_long_form_event_columns(
+            &headers,
+            mapping,
+            timestamp_column_index,
+        )?;
+
+        if let Some(event) = &long_form_event {
+            ignored_columns.insert(event.feature_column);
+            if let Some(index) = event.value_column {
+                ignored_columns.insert(index);
+            }
+            if let Some(index) = event.table_column {
+                ignored_columns.insert(index);
+            }
+            if let Some(index) = event.visit_column {
+                ignored_columns.insert(index);
+            }
+        }
+
+        let column_actions = build_column_actions(
+            &headers,
+            id_column_index,
+            outcome_column,
+            note_column_index,
+            timestamp_column_index,
+            &known_columns,
+            &feature_blacklist,
+            mapping,
+            &ignored_columns,
+        );
+
+        let measurement_columns =
+            if has_timestamp && long_form_event.is_none() {
+                headers
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, header)| {
+                        Some(*index) != id_column_index
+                            && Some(*index) != timestamp_column_index
+                            && Some(*index) != note_column_index
+                            && !ignored_columns.contains(index)
+                            && !known_columns.contains_key(
+                                normalize_column_name(header).as_str(),
+                            )
+                            && !feature_blacklist.contains(
+                                normalize_column_name(header).as_str(),
+                            )
+                    })
+                    .map(|(index, header)| {
+                        (index, header.clone())
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
             };
+
+        let mut generated_patient_id = 0usize;
+        let mut batch = Vec::with_capacity(10_000);
+        let mut imported = 0usize;
+
+        for record_result in reader.records() {
+            let record = record_result?;
+
+            let patient_id =
+                resolve_patient_id(
+                    &record,
+                    id_column_index,
+                    &mut generated_patient_id,
+                );
 
             let mut patient = PatientData {
-                patient_id: patient_id.clone(),
-                ..Default::default()
+                patient_id,
+                ..PatientData::default()
             };
 
-            if is_temporal {
-                let timestamp = timestamp_col_idx
-                    .and_then(|idx| record.get(idx))
-                    .map(|s| s.trim().to_string())
-                    .unwrap_or_default();
-
-                for (col_idx, measurement_type) in &measurement_cols {
-                    if let Some(value_str) = record.get(*col_idx) {
-                        if let Ok(value) = value_str.trim().parse::<f32>() {
-                            patient.temporal_measurements.push(TemporalMeasurement {
-                                timestamp: timestamp.clone(),
-                                measurement_type: measurement_type.clone(),
-                                value,
-                            });
-                        }
-                    }
-                }
-            } else if is_text {
-                if let Some(text_idx) = note_col_idx {
-                    if let Some(content) = record.get(text_idx) {
-                        let content = content.trim();
-                        if !content.is_empty() {
-                            let note = if let Some(type_idx) = note_type_col_idx {
-                                let note_type = record.get(type_idx).unwrap_or("").trim();
-                                if !note_type.is_empty() {
-                                    format!("[{}] {}", note_type, content)
-                                } else {
-                                    content.to_string()
-                                }
-                            } else {
-                                content.to_string()
-                            };
-                            patient.clinical_notes.push(note);
-                        }
-                    }
-                }
+            if let Some(event) = &long_form_event {
+                import_long_form_event(&record, event, &mut patient);
             } else {
-                for (i, value) in record.iter().enumerate() {
-                    let v_str = value.trim();
-                    if v_str.is_empty() {
-                        continue;
-                    }
+                // A wide export may contain static features, observations, and notes
+                // in the same row. Import each modality independently.
+                import_static_fields(&record, &column_actions, &mut patient);
 
-                    match &col_actions[i] {
-                        ColAction::Skip => continue,
-                        ColAction::Gender => {
-                            let v_lower = v_str.to_lowercase();
-                            if v_lower == "male" || v_lower == "m" {
-                                skip_patient = true;
-                                break;
-                            }
-                        }
-                        ColAction::Known(field_name) => match *field_name {
-                            "race" => patient.race = Some(v_str.to_string()),
-                            "insurance" => patient.insurance = Some(v_str.to_string()),
-                            "risk_level" => patient.risk_level = Some(v_str.to_string()),
-                            "age" => {
-                                if let Ok(v) = v_str.parse::<f32>() {
-                                    patient.age = Some(v)
-                                }
-                            }
-                            "blood_pressure" => {
-                                if let Ok(v) = v_str.parse::<f32>() {
-                                    patient.blood_pressure = Some(v)
-                                }
-                            }
-                            "systolic_bp" => {
-                                if let Ok(v) = v_str.parse::<f32>() {
-                                    patient.systolic_bp = Some(v)
-                                }
-                            }
-                            "diastolic_bp" => {
-                                if let Ok(v) = v_str.parse::<f32>() {
-                                    patient.diastolic_bp = Some(v)
-                                }
-                            }
-                            "glucose" => {
-                                if let Ok(v) = v_str.parse::<f32>() {
-                                    patient.glucose = Some(v)
-                                }
-                            }
-                            "bmi" => {
-                                if let Ok(v) = v_str.parse::<f32>() {
-                                    patient.bmi = Some(v)
-                                }
-                            }
-                            "pregnancies" => {
-                                if let Ok(v) = v_str.parse::<u32>() {
-                                    patient.pregnancies = Some(v)
-                                }
-                            }
-                            "existing_outcome" => {
-                                if let Ok(v) = v_str.parse::<f32>() {
-                                    patient.existing_outcome = Some(v)
-                                }
-                            }
-                            "cause_code" => {
-                                if let Ok(v) = v_str.parse::<u32>() {
-                                    patient.cause_code = Some(v)
-                                }
-                            }
-                            _ => {}
-                        },
-                        ColAction::Extra(col_name) => {
-                            if let Ok(v) = v_str.parse::<f32>() {
-                                patient.extra_features.insert(col_name.clone(), v);
-                            }
-                        }
-                    }
+                if has_timestamp {
+                    import_observations(
+                        &record,
+                        timestamp_column_index,
+                        &measurement_columns,
+                        &mut patient,
+                    );
                 }
             }
 
-            if skip_patient {
-                continue;
+            if has_notes {
+                import_note(
+                    &record,
+                    note_column_index,
+                    note_type_column_index,
+                    &mut patient,
+                );
             }
 
             batch.push(patient);
 
-            if batch.len() >= BATCH_SIZE {
-                self.insert_patient_batch(&batch, dataset_source)?;
-                total_count += batch.len();
+            if batch.len() >= 10_000 {
+                self.insert_patient_batch(
+                    &batch,
+                    dataset_source,
+                )?;
+
+                imported += batch.len();
                 batch.clear();
 
-                if total_count % 100_000 == 0 {
-                    info!("  Imported {} records so far...", total_count);
-                }
+                info!(
+                    "Imported {} records from {}",
+                    imported,
+                    path.display()
+                );
             }
         }
 
-        // Insert remaining records
         if !batch.is_empty() {
-            self.insert_patient_batch(&batch, dataset_source)?;
-            total_count += batch.len();
+            self.insert_patient_batch(
+                &batch,
+                dataset_source,
+            )?;
+
+            imported += batch.len();
         }
 
-        info!("Imported {} records from CSV", total_count);
-        Ok(total_count)
+        info!(
+            "Imported {} records from {}",
+            imported,
+            path.display()
+        );
+
+        Ok(imported)
     }
 
-    /// Insert a batch of patients in a single transaction
+    /// Insert a batch of patients in a single transaction.
+    ///
+    /// Statements are prepared once per transaction rather than once per patient. This is
+    /// important for large CSV imports, where preparing statements repeatedly can dominate the
+    /// cost of parsing and inserting the data.
     fn insert_patient_batch(
         &mut self,
         patients: &[PatientData],
         dataset_source: Option<&str>,
     ) -> AppResult<()> {
-        let mut tx = self.conn.transaction()?;
+        let tx = self.conn.transaction()?;
+        let mut patient_stmt = tx.prepare_cached(
+            "INSERT INTO patients (
+                patient_id, sex, age, race, insurance, systolic_bp, diastolic_bp,
+                glucose, bmi, pregnancies, risk_level, has_complications,
+                risk_score, existing_outcome, cause_code, image_count, has_ultrasound, dataset_source
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+            ON CONFLICT(patient_id) DO UPDATE SET
+	            sex = COALESCE(excluded.sex, patients.sex),
+	            age = COALESCE(excluded.age, patients.age),
+	            race = COALESCE(excluded.race, patients.race),
+	            insurance = COALESCE(excluded.insurance, patients.insurance),
+	            systolic_bp = COALESCE(excluded.systolic_bp, patients.systolic_bp),
+	            diastolic_bp = COALESCE(excluded.diastolic_bp, patients.diastolic_bp),
+	            glucose = COALESCE(excluded.glucose, patients.glucose),
+	            bmi = COALESCE(excluded.bmi, patients.bmi),
+	            pregnancies = COALESCE(excluded.pregnancies, patients.pregnancies),
+	            risk_level = COALESCE(excluded.risk_level, patients.risk_level),
+	            has_complications =
+	                patients.has_complications
+	                OR excluded.has_complications,
+	            risk_score = MAX(patients.risk_score, excluded.risk_score),
+	            existing_outcome =
+	                COALESCE(excluded.existing_outcome, patients.existing_outcome),
+	            cause_code =
+	                COALESCE(excluded.cause_code, patients.cause_code),
+	            image_count =
+	                patients.image_count + excluded.image_count,
+	            has_ultrasound =
+	                patients.has_ultrasound OR excluded.has_ultrasound,
+	            dataset_source =
+	                COALESCE(excluded.dataset_source, patients.dataset_source)",
+        )?;
+        let mut feature_stmt = tx.prepare_cached(
+            "INSERT OR REPLACE INTO baseline_features (patient_id, feature_name, value)
+             VALUES (?, ?, ?)",
+        )?;
+        let mut observation_stmt = tx.prepare_cached(
+            "INSERT INTO patient_observations (patient_id, timestamp, feature_name, value)
+             VALUES (?, ?, ?, ?)",
+        )?;
+        let mut note_stmt =
+            tx.prepare_cached("INSERT INTO clinical_notes (patient_id, content) VALUES (?, ?)")?;
 
         for patient in patients {
-            Self::upsert_patient_tx(&tx, patient, dataset_source)?;
+            patient_stmt.execute(params![
+                patient.patient_id,
+                patient.sex,
+                patient.age,
+                patient.race,
+                patient.insurance,
+                patient.systolic_bp,
+                patient.diastolic_bp,
+                patient.glucose,
+                patient.bmi,
+                patient.pregnancies,
+                patient.risk_level,
+                patient.has_complications,
+                patient.risk_score,
+                patient.existing_outcome,
+                patient.cause_code,
+                patient.image_count as i64,
+                patient.has_ultrasound,
+                dataset_source,
+            ])?;
 
-            if !patient.temporal_measurements.is_empty() {
-                let mut stmt = tx.prepare_cached(
-                    "INSERT INTO temporal_measurements (patient_id, timestamp, measurement_type, value)
-                        VALUES (?, ?, ?, ?)",
-                )?;
-                for m in &patient.temporal_measurements {
-                    stmt.execute(params![
-                        patient.patient_id,
-                        m.timestamp,
-                        m.measurement_type,
-                        m.value
-                    ])?;
-                }
+            for (name, value) in &patient.extra_features {
+                feature_stmt.execute(params![patient.patient_id, name, value])?;
             }
 
-            if !patient.clinical_notes.is_empty() {
-                let mut stmt = tx.prepare_cached(
-                    "INSERT INTO clinical_notes (patient_id, content) VALUES (?, ?)",
-                )?;
-                for note in &patient.clinical_notes {
-                    stmt.execute(params![patient.patient_id, note])?;
-                }
+            for observation in &patient.observations {
+                observation_stmt.execute(params![
+                    patient.patient_id,
+                    observation.timestamp,
+                    observation.feature_name,
+                    observation.value,
+                ])?;
+            }
+
+            for note in &patient.clinical_notes {
+                note_stmt.execute(params![patient.patient_id, note])?;
             }
         }
+
+        drop(note_stmt);
+        drop(observation_stmt);
+        drop(feature_stmt);
+        drop(patient_stmt);
 
         tx.commit()?;
         Ok(())
@@ -1826,15 +1990,14 @@ impl DatabaseManager {
     ) -> AppResult<()> {
         tx.execute(
             "INSERT INTO patients (
-                patient_id, age, race, insurance, blood_pressure, systolic_bp, diastolic_bp,
+                patient_id, age, race, insurance, systolic_bp, diastolic_bp,
                 glucose, bmi, pregnancies, risk_level, has_complications,
                 risk_score, existing_outcome, cause_code, image_count, has_ultrasound, dataset_source
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
             ON CONFLICT(patient_id) DO UPDATE SET
                 age = coalesce(excluded.age, age),
                 race = coalesce(excluded.race, race),
                 insurance = coalesce(excluded.insurance, insurance),
-                blood_pressure = coalesce(excluded.blood_pressure, blood_pressure),
                 systolic_bp = coalesce(excluded.systolic_bp, systolic_bp),
                 diastolic_bp = coalesce(excluded.diastolic_bp, diastolic_bp),
                 glucose = coalesce(excluded.glucose, glucose),
@@ -1854,7 +2017,6 @@ impl DatabaseManager {
                 patient.age,
                 patient.race,
                 patient.insurance,
-                patient.blood_pressure,
                 patient.systolic_bp,
                 patient.diastolic_bp,
                 patient.glucose,
@@ -1873,7 +2035,7 @@ impl DatabaseManager {
 
         // Insert extra features
         let mut stmt = tx.prepare_cached(
-            "INSERT OR REPLACE INTO patient_features (patient_id, feature_name, value)
+            "INSERT OR REPLACE INTO baseline_features (patient_id, feature_name, value)
              VALUES (?, ?, ?)",
         )?;
         for (name, value) in &patient.extra_features {
@@ -1891,14 +2053,14 @@ impl DatabaseManager {
         // Insert temporal measurements
         {
             let mut stmt = tx.prepare(
-                "INSERT INTO temporal_measurements (patient_id, timestamp, measurement_type, value)
+                "INSERT INTO patient_observations (patient_id, timestamp, feature_name, value)
                  VALUES (?, ?, ?, ?)",
             )?;
-            for m in &patient.temporal_measurements {
+            for m in &patient.observations {
                 stmt.execute(params![
                     patient.patient_id,
                     m.timestamp,
-                    m.measurement_type,
+                    m.feature_name,
                     m.value
                 ])?;
             }
@@ -1920,7 +2082,7 @@ impl DatabaseManager {
     /// Retrieve a single patient by ID
     pub fn get_patient(&self, patient_id: &str) -> AppResult<Option<PatientData>> {
         let mut stmt = self.conn.prepare(
-            "SELECT age, blood_pressure, systolic_bp, diastolic_bp, glucose, bmi,
+            "SELECT age, systolic_bp, diastolic_bp, glucose, bmi,
                     pregnancies, risk_level, has_complications, risk_score,
                     existing_outcome, image_count, has_ultrasound
              FROM patients WHERE patient_id = ?1",
@@ -1932,24 +2094,23 @@ impl DatabaseManager {
             let mut patient = PatientData {
                 patient_id: patient_id.to_string(),
                 age: row.get(0)?,
-                blood_pressure: row.get(1)?,
-                systolic_bp: row.get(2)?,
-                diastolic_bp: row.get(3)?,
-                glucose: row.get(4)?,
-                bmi: row.get(5)?,
-                pregnancies: row.get(6)?,
-                risk_level: row.get(7)?,
-                has_complications: row.get(8)?,
-                risk_score: row.get(9)?,
-                existing_outcome: row.get(10)?,
-                image_count: row.get::<_, i64>(11)? as usize,
-                has_ultrasound: row.get(12)?,
+                systolic_bp: row.get(1)?,
+                diastolic_bp: row.get(2)?,
+                glucose: row.get(3)?,
+                bmi: row.get(4)?,
+                pregnancies: row.get(5)?,
+                risk_level: row.get(6)?,
+                has_complications: row.get(7)?,
+                risk_score: row.get(8)?,
+                existing_outcome: row.get(9)?,
+                image_count: row.get::<_, i64>(10)? as usize,
+                has_ultrasound: row.get(11)?,
                 ..Default::default()
             };
 
             // Load related data
             patient.extra_features = self.get_patient_features(patient_id)?;
-            patient.temporal_measurements = self.get_temporal_measurements(patient_id)?;
+            patient.observations = self.get_observations(patient_id)?;
             patient.clinical_notes = self.get_clinical_notes(patient_id)?;
 
             Ok(Some(patient))
@@ -1960,13 +2121,16 @@ impl DatabaseManager {
 
     /// Retrieve all patient IDs
     pub fn get_all_patient_ids(&self) -> AppResult<Vec<String>> {
-        let mut stmt = self.conn.prepare("SELECT patient_id FROM patients")?;
-        let rows = stmt.query_map([], |row| row.get(0))?;
+        let mut stmt = self.conn.prepare(
+        	"SELECT patient_id
+         	FROM patients
+          	ORDER BY patient_id"
+        )?;
 
-        let mut ids = Vec::new();
-        for id in rows {
-            ids.push(id?);
-        }
+        let ids = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+
         Ok(ids)
     }
 
@@ -2051,7 +2215,6 @@ impl DatabaseManager {
         // Compute stats for core numeric columns
         let core_columns = [
             "age",
-            "blood_pressure",
             "systolic_bp",
             "diastolic_bp",
             "glucose",
@@ -2142,7 +2305,7 @@ impl DatabaseManager {
                     MIN(value),
                     MAX(value),
                     COUNT(value)
-             FROM patient_features WHERE feature_name = ?",
+             FROM baseline_features WHERE feature_name = ?",
         )?;
 
         let result: Option<(f64, f64, f64, f64, i64)> = stmt
@@ -2178,7 +2341,7 @@ impl DatabaseManager {
     fn get_all_feature_names(&self) -> AppResult<Vec<String>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT DISTINCT feature_name FROM patient_features")?;
+            .prepare("SELECT DISTINCT feature_name FROM baseline_features")?;
         let rows = stmt.query_map([], |row| row.get(0))?;
 
         let mut names = Vec::new();
@@ -2190,95 +2353,41 @@ impl DatabaseManager {
 
     /// Save a normalizer to the database
     pub fn save_normalizer(&mut self, normalizer: &Normalizer) -> AppResult<()> {
-        let tx = self.conn.transaction()?;
-
-        // Clear existing
-        tx.execute("DELETE FROM normalization_stats", [])?;
-
-        {
-            // Insert new
-            let mut stmt = tx.prepare(
-                "INSERT INTO normalization_stats (feature_name, mean, std, min, max, count)
-	             VALUES (?, ?, ?, ?, ?, ?)",
-            )?;
-
-            for (name, stats) in &normalizer.feature_stats {
-                stmt.execute(params![
-                    name,
-                    stats.mean,
-                    stats.std,
-                    stats.min,
-                    stats.max,
-                    stats.count
-                ])?;
-            }
-        }
-
-        tx.commit()?;
-        info!(
-            "Saved normalizer with {} features to database",
-            normalizer.feature_stats.len()
-        );
-        Ok(())
+        let _ = normalizer;
+        Err(AppError::DomainError(
+            "Normalization statistics are stored in model artifacts, not SQLite".to_string(),
+        ))
     }
 
     /// Load a normalizer from the database
     pub fn load_normalizer(&self) -> AppResult<Option<Normalizer>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT feature_name, mean, std, min, max, count FROM normalization_stats")?;
-
-        let rows: Vec<FeatureStats> = stmt
-            .query_map([], |row| {
-                Ok(FeatureStats {
-                    name: row.get(0)?,
-                    mean: row.get(1)?,
-                    std: row.get(2)?,
-                    min: row.get(3)?,
-                    max: row.get(4)?,
-                    count: row.get(5)?,
-                })
-            })?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        if rows.is_empty() {
-            return Ok(None);
-        }
-
-        let mut feature_stats = HashMap::new();
-        let mut feature_order = Vec::new();
-
-        for stats in rows {
-            feature_order.push(stats.name.clone());
-            feature_stats.insert(stats.name.clone(), stats);
-        }
-
-        Ok(Some(Normalizer {
-            feature_stats,
-            feature_order,
-            categorical_columns: HashSet::new(),
-            exclude_columns: HashSet::new(),
-            method: NormalizationMethod::ZScore,
-            missing_value: 0.0,
-        }))
+        Ok(None)
     }
 
-    /// Removes patients that are not part of the maternal cohort.
-    pub fn cleanup_non_maternal_patients(&mut self) -> AppResult<usize> {
+    pub fn cleanup_non_maternal_patients(
+        &mut self,
+    ) -> AppResult<usize> {
         let tx = self.conn.transaction()?;
 
-        let deleted = tx.execute(
+        let removed = tx.execute(
             "DELETE FROM patients
-            WHERE pregnancies = 0
-	            OR (pregnancies IS NULL
-	                AND dataset_source NOT LIKE '%maternal%'
-	                AND dataset_source NOT LIKE '%preg%')",
+             WHERE LOWER(TRIM(COALESCE(sex, ''))) IN (
+                 'male',
+                 'm',
+                 'man',
+                 'boy'
+             )",
             [],
         )?;
 
         tx.commit()?;
-        Ok(deleted)
+
+        info!(
+            "Removed {} explicitly non-maternal patients",
+            removed
+        );
+
+        Ok(removed)
     }
 
     // =========================================================================
@@ -2288,7 +2397,7 @@ impl DatabaseManager {
     fn get_patient_features(&self, patient_id: &str) -> AppResult<HashMap<String, f32>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT feature_name, value FROM patient_features WHERE patient_id = ?")?;
+            .prepare("SELECT feature_name, value FROM baseline_features WHERE patient_id = ?")?;
         let rows = stmt.query_map(params![patient_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
 
         let mut features = HashMap::new();
@@ -2299,14 +2408,15 @@ impl DatabaseManager {
         Ok(features)
     }
 
-    fn get_temporal_measurements(&self, patient_id: &str) -> AppResult<Vec<TemporalMeasurement>> {
+    fn get_observations(&self, patient_id: &str) -> AppResult<Vec<PatientObservation>> {
         let mut stmt = self.conn.prepare(
-            "SELECT timestamp, measurement_type, value FROM temporal_measurements WHERE patient_id = ?",
+            "SELECT timestamp, feature_name, value FROM patient_observations WHERE patient_id = ?
+             ORDER BY timestamp, observation_id",
         )?;
         let rows = stmt.query_map(params![patient_id], |row| {
-            Ok(TemporalMeasurement {
+            Ok(PatientObservation {
                 timestamp: row.get(0)?,
-                measurement_type: row.get(1)?,
+                feature_name: row.get(1)?,
                 value: row.get(2)?,
             })
         })?;
@@ -2333,8 +2443,15 @@ impl DatabaseManager {
 }
 
 // =============================================================================
-// Helper Types
+// Helpers
 // =============================================================================
+
+#[derive(Debug, Clone)]
+enum ColumnAction {
+    Skip,
+    Known(String),
+    Extra(String),
+}
 
 /// Iterator that yields batches of patients from the database
 ///
@@ -2385,17 +2502,479 @@ impl BatchIterator {
 
 /// Counts of samples for each modality in the database
 #[derive(Debug, Clone, Default)]
-pub struct ModalityCounts {
-    pub tabular: usize,
-    pub temporal: usize,
+pub struct SampleCounts {
+    pub sequences: usize,
     pub text: usize,
     pub image: usize,
     pub outcomes: usize,
 }
 
-// =============================================================================
-// Serialization Helpers
-// =============================================================================
+fn normalize_column_name(value: &str) -> String {
+    value
+        .trim()
+        .to_ascii_lowercase()
+        .replace([' ', '-', '.'], "_")
+}
+
+fn find_column(headers: &[String], configured_name: &str) -> Option<usize> {
+    let configured = normalize_column_name(configured_name);
+    headers
+        .iter()
+        .position(|header| normalize_column_name(header) == configured)
+}
+
+#[derive(Debug, Clone)]
+struct LongFormEventColumns {
+    timestamp_column: usize,
+    feature_column: usize,
+    value_column: Option<usize>,
+    table_column: Option<usize>,
+    visit_column: Option<usize>,
+    presence_value: f32,
+}
+
+fn build_long_form_event_columns(
+    headers: &[String],
+    mapping: Option<&ColumnMapping>,
+    timestamp_column: Option<usize>,
+) -> AppResult<Option<LongFormEventColumns>> {
+    let Some(mapping) = mapping else {
+        return Ok(None);
+    };
+
+    let Some(feature_name) = mapping.event_feature_column.as_deref() else {
+        return Ok(None);
+    };
+
+    let timestamp_column = timestamp_column.ok_or_else(|| {
+        AppError::InvalidData(
+            "long-form event mapping requires a timestamp_column".to_string(),
+        )
+    })?;
+
+    let feature_column = find_column(headers, feature_name).ok_or_else(|| {
+        AppError::InvalidData(format!(
+            "long-form event feature column does not exist: {}",
+            feature_name
+        ))
+    })?;
+
+    let resolve_optional = |name: Option<&String>, label: &str| -> AppResult<Option<usize>> {
+        name.map(|value| {
+            find_column(headers, value).ok_or_else(|| {
+                AppError::InvalidData(format!(
+                    "long-form event {} column does not exist: {}",
+                    label, value
+                ))
+            })
+        })
+        .transpose()
+    };
+
+    Ok(Some(LongFormEventColumns {
+        timestamp_column,
+        feature_column,
+        value_column: resolve_optional(mapping.event_value_column.as_ref(), "value")?,
+        table_column: resolve_optional(mapping.event_table_column.as_ref(), "table")?,
+        visit_column: resolve_optional(mapping.event_visit_column.as_ref(), "visit")?,
+        presence_value: if mapping.event_presence_value.is_finite() {
+            mapping.event_presence_value
+        } else {
+            return Err(AppError::InvalidData(
+                "long-form event presence value must be finite".to_string(),
+            ));
+        },
+    }))
+}
+
+fn find_patient_id_column(
+    headers: &[String],
+    configured_name: &str,
+) -> Option<usize> {
+    let configured =
+        normalize_column_name(configured_name);
+
+    headers.iter().position(|header| {
+        let normalized =
+            normalize_column_name(header);
+
+        normalized == configured
+            || normalized == "patient_id"
+            || normalized == "patientid"
+            || normalized == "subject_id"
+            || normalized == "subjectid"
+    })
+}
+
+fn resolve_patient_id(
+    record: &csv::StringRecord,
+    id_column_index: Option<usize>,
+    generated_patient_id: &mut usize,
+) -> String {
+    if let Some(index) = id_column_index {
+        let value = record
+            .get(index)
+            .unwrap_or("")
+            .trim();
+
+        if !value.is_empty() {
+            return value.to_string();
+        }
+    }
+
+    *generated_patient_id += 1;
+    format!("P{:06}", generated_patient_id)
+}
+
+fn known_column_mappings() -> HashMap<String, &'static str> {
+    [
+        ("age", "age"),
+        ("anchor_age", "age"),
+        ("race", "race"),
+        ("sex", "sex"),
+        ("gender", "sex"),
+        ("insurance", "insurance"),
+        ("systolic_bp", "systolic_bp"),
+        ("systolicbp", "systolic_bp"),
+        ("diastolic_bp", "diastolic_bp"),
+        ("diastolicbp", "diastolic_bp"),
+        ("glucose", "glucose"),
+        ("blood_sugar", "glucose"),
+        ("bloodsugar", "glucose"),
+        ("bs", "glucose"),
+        ("bmi", "bmi"),
+        ("body_mass_index", "bmi"),
+        ("bodymassindex", "bmi"),
+        ("pregnancies", "pregnancies"),
+        ("gravida", "pregnancies"),
+        ("risk_level", "risk_level"),
+        ("risklevel", "risk_level"),
+        ("outcome", "existing_outcome"),
+        ("mortality", "existing_outcome"),
+        ("hospital_expire_flag", "existing_outcome"),
+        ("mortality_label", "existing_outcome"),
+        ("cause_code", "cause_code"),
+        ("causecode", "cause_code"),
+        ("cause", "cause_code"),
+    ]
+    .into_iter()
+    .map(|(name, field)| (name.to_string(), field))
+    .collect()
+}
+
+fn feature_blacklist() -> HashSet<String> {
+    [
+        "hadm_id",
+        "anchor_year",
+        "anchor_year_group",
+        "dod",
+        "subject_id",
+        "subjectid",
+        "row_id",
+        "charttime",
+        "storetime",
+        "admittime",
+        "dischtime",
+        "intime",
+        "outtime",
+        "deathtime",
+        "edregtime",
+        "edouttime",
+        "hospital_expire_flag",
+        "expire_flag",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+fn build_column_actions(
+    headers: &[String],
+    patient_id_index: Option<usize>,
+    outcome_index: Option<usize>,
+    note_index: Option<usize>,
+    timestamp_index: Option<usize>,
+    known_columns: &HashMap<String, &'static str>,
+    feature_blacklist: &HashSet<String>,
+    mapping: Option<&ColumnMapping>,
+    ignored_columns: &HashSet<usize>,
+) -> Vec<ColumnAction> {
+    headers
+        .iter()
+        .enumerate()
+        .map(|(index, header)| {
+            if Some(index) == patient_id_index
+                || Some(index) == note_index
+                || Some(index) == timestamp_index
+                || ignored_columns.contains(&index)
+            {
+                return ColumnAction::Skip;
+            }
+
+            let normalized = normalize_column_name(header);
+
+            if Some(index) == outcome_index {
+                return ColumnAction::Known("existing_outcome".to_string());
+            }
+
+            if let Some(alias) = mapping.and_then(|value| {
+                value.feature_aliases.iter().find_map(|(source, target)| {
+                    (normalize_column_name(source) == normalized).then(|| target.clone())
+                })
+            }) {
+                let alias = normalize_column_name(&alias);
+                return if known_columns.values().any(|field| *field == alias)
+                    || alias == "existing_outcome"
+                {
+                    ColumnAction::Known(alias)
+                } else {
+                    ColumnAction::Extra(alias)
+                };
+            }
+
+            if let Some(field) = known_columns.get(&normalized) {
+                ColumnAction::Known((*field).to_string())
+            } else if feature_blacklist.contains(&normalized) {
+                ColumnAction::Skip
+            } else {
+                ColumnAction::Extra(header.clone())
+            }
+        })
+        .collect()
+}
+
+fn import_long_form_event(
+    record: &csv::StringRecord,
+    columns: &LongFormEventColumns,
+    patient: &mut PatientData,
+) {
+    let Some(feature) = record
+        .get(columns.feature_column)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return;
+    };
+
+    let table = columns
+        .table_column
+        .and_then(|index| record.get(index))
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    let feature_name = table
+        .map(|table| format!("{table}:{feature}"))
+        .unwrap_or_else(|| feature.to_string());
+
+    let value = columns
+        .value_column
+        .and_then(|index| record.get(index))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|value| value.parse::<f32>().ok())
+        .filter(|value| value.is_finite())
+        .unwrap_or(columns.presence_value);
+
+    let timestamp = record
+        .get(columns.timestamp_column)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("unknown");
+
+    let timestamp = columns
+        .visit_column
+        .and_then(|index| record.get(index))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|visit| format!("{timestamp}#visit:{visit}"))
+        .unwrap_or_else(|| timestamp.to_string());
+
+    patient.observations.push(PatientObservation {
+        timestamp,
+        feature_name,
+        value,
+    });
+}
+
+fn import_observations(
+    record: &csv::StringRecord,
+    timestamp_column_index: Option<usize>,
+    measurement_columns: &[(usize, String)],
+    patient: &mut PatientData,
+) {
+    let timestamp = timestamp_column_index
+        .and_then(|index| record.get(index))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("unknown")
+        .to_string();
+
+    for (column_index, feature_name) in measurement_columns {
+        let Some(raw_value) =
+            record.get(*column_index)
+        else {
+            continue;
+        };
+
+        let Ok(value) =
+            raw_value.trim().parse::<f32>()
+        else {
+            continue;
+        };
+
+        if !value.is_finite() {
+            continue;
+        }
+
+        patient.observations.push(
+            PatientObservation {
+                timestamp: timestamp.clone(),
+                feature_name: feature_name.clone(),
+                value,
+            },
+        );
+    }
+}
+
+fn import_note(
+    record: &csv::StringRecord,
+    note_column_index: Option<usize>,
+    note_type_column_index: Option<usize>,
+    patient: &mut PatientData,
+) {
+    let Some(note_index) = note_column_index else {
+        return;
+    };
+
+    let Some(content) =
+        record.get(note_index)
+    else {
+        return;
+    };
+
+    let content = content.trim();
+
+    if content.is_empty() {
+        return;
+    }
+
+    let note = match note_type_column_index
+        .and_then(|index| record.get(index))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(note_type) => {
+            format!("[{}] {}", note_type, content)
+        }
+        None => content.to_string(),
+    };
+
+    patient.clinical_notes.push(note);
+}
+
+fn import_static_fields(
+    record: &csv::StringRecord,
+    actions: &[ColumnAction],
+    patient: &mut PatientData,
+) {
+    for (index, value) in record.iter().enumerate() {
+        let value = value.trim();
+
+        if value.is_empty() {
+            continue;
+        }
+
+        let Some(action) = actions.get(index) else {
+            continue;
+        };
+
+        match action {
+            ColumnAction::Skip => {}
+
+            ColumnAction::Known(field_name) => {
+                assign_known_field(patient, field_name, value);
+            }
+
+            ColumnAction::Extra(name) => {
+                if let Ok(value) =
+                    value.parse::<f32>()
+                {
+                    if value.is_finite() {
+                        patient
+                            .extra_features
+                            .insert(name.clone(), value);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn assign_known_field(
+    patient: &mut PatientData,
+    field_name: &str,
+    value: &str,
+) {
+    match field_name {
+    	"sex" | "gender" => {
+     		patient.sex = Some(value.to_string());
+     	}
+
+        "age" => {
+            patient.age = value.parse::<f32>().ok();
+        }
+
+        "race" => {
+            patient.race = Some(value.to_string());
+        }
+
+        "insurance" => {
+            patient.insurance = Some(value.to_string());
+        }
+
+        "systolic_bp" => {
+            patient.systolic_bp =
+                value.parse::<f32>().ok();
+        }
+
+        "diastolic_bp" => {
+            patient.diastolic_bp =
+                value.parse::<f32>().ok();
+        }
+
+        "glucose" => {
+            patient.glucose =
+                value.parse::<f32>().ok();
+        }
+
+        "bmi" => {
+            patient.bmi =
+                value.parse::<f32>().ok();
+        }
+
+        "pregnancies" => {
+            patient.pregnancies =
+                value.parse::<u32>().ok();
+        }
+
+        "risk_level" => {
+            patient.risk_level =
+                Some(value.to_string());
+        }
+
+        "existing_outcome" => {
+            patient.existing_outcome =
+                value.parse::<f32>().ok();
+        }
+
+        "cause_code" => {
+            patient.cause_code =
+                value.parse::<u32>().ok();
+        }
+
+        _ => {}
+    }
+}
 
 /// Serialize a Vec<f32> to bytes
 fn serialize_f32_vec(data: &[f32]) -> Vec<u8> {
@@ -2406,12 +2985,22 @@ fn serialize_f32_vec(data: &[f32]) -> Vec<u8> {
     bytes
 }
 
-/// Deserialize bytes to Vec<f32>
-fn deserialize_f32_vec(bytes: &[u8]) -> Vec<f32> {
-    bytes
-        .chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-        .collect()
+fn deserialize_f32_vec(bytes: &[u8]) -> AppResult<Vec<f32>> {
+    if bytes.len() % 4 != 0 {
+        return Err(AppError::InvalidData(
+            "Invalid f32 vector blob length".to_string(),
+        ));
+    }
+
+    let mut values = Vec::with_capacity(bytes.len() / 4);
+
+    for chunk in bytes.chunks_exact(4) {
+        values.push(f32::from_le_bytes(chunk.try_into().map_err(|_| {
+            AppError::InvalidData("Invalid f32 vector value".to_string())
+        })?));
+    }
+
+    Ok(values)
 }
 
 /// Serialize a Vec<usize> to bytes
@@ -2424,42 +3013,24 @@ fn serialize_usize_vec(data: &[usize]) -> Vec<u8> {
 }
 
 /// Deserialize bytes to Vec<usize>
-fn deserialize_usize_vec(bytes: &[u8]) -> Vec<usize> {
-    bytes
-        .chunks_exact(8)
-        .map(|chunk| {
-            u64::from_le_bytes([
-                chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
-            ]) as usize
-        })
-        .collect()
-}
-
-/// Serialize a temporal sequence (Vec<Vec<f32>>) to bytes
-fn serialize_temporal_sequence(sequence: &[Vec<f32>]) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    for timestep in sequence {
-        bytes.extend(serialize_f32_vec(timestep));
-    }
-    bytes
-}
-
-/// Deserialize bytes to a temporal sequence
-fn deserialize_temporal_sequence(
-    bytes: &[u8],
-    seq_length: usize,
-    feature_dim: usize,
-) -> Vec<Vec<f32>> {
-    if feature_dim == 0 || seq_length == 0 {
-        return Vec::new();
+fn deserialize_usize_vec(bytes: &[u8]) -> AppResult<Vec<usize>> {
+    if bytes.len() % 8 != 0 {
+        return Err(AppError::InvalidData(
+            "Invalid usize vector blob length".to_string(),
+        ));
     }
 
-    let step_size = feature_dim * 4; // 4 bytes per f32
-    bytes
-        .chunks(step_size)
-        .take(seq_length)
-        .map(|chunk| deserialize_f32_vec(chunk))
-        .collect()
+    let mut values = Vec::with_capacity(bytes.len() / 8);
+
+    for chunk in bytes.chunks_exact(8) {
+        values.push(u64::from_le_bytes(
+            chunk
+                .try_into()
+                .map_err(|_| AppError::InvalidData("Invalid usize vector value".to_string()))?,
+        ) as usize);
+    }
+
+    Ok(values)
 }
 
 /// Serialize an Array3<f32> to bytes
@@ -2469,8 +3040,91 @@ fn serialize_array3(array: &Array3<f32>) -> Vec<u8> {
 }
 
 /// Deserialize bytes to Array3<f32>
-fn deserialize_array3(bytes: &[u8], channels: usize, height: usize, width: usize) -> Array3<f32> {
-    let data = deserialize_f32_vec(bytes);
+fn deserialize_array3(
+    bytes: &[u8],
+    channels: usize,
+    height: usize,
+    width: usize,
+) -> AppResult<Array3<f32>> {
+    let data = deserialize_f32_vec(bytes)?;
     Array3::from_shape_vec((channels, height, width), data)
-        .unwrap_or_else(|_| Array3::zeros((channels, height, width)))
+        .map_err(|_| AppError::InvalidData("Invalid Array3<f32> shape".to_string()))
+}
+
+fn serialize_dynamic_sequence(sequence: &[Vec<f32>]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+
+    let sequence_length = sequence.len() as u64;
+    bytes.extend_from_slice(&sequence_length.to_le_bytes());
+
+    let feature_count = sequence.first().map(|timestep| timestep.len()).unwrap_or(0) as u64;
+
+    bytes.extend_from_slice(&feature_count.to_le_bytes());
+
+    for timestep in sequence {
+        for &value in timestep {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+
+    bytes
+}
+
+fn deserialize_dynamic_sequence(bytes: &[u8]) -> AppResult<Vec<Vec<f32>>> {
+    if bytes.len() < 16 {
+        return Err(AppError::InvalidData(
+            "Dynamic sequence blob is too short".to_string(),
+        ));
+    }
+
+    let sequence_length = u64::from_le_bytes(
+        bytes[0..8]
+            .try_into()
+            .map_err(|_| AppError::InvalidData("Invalid sequence length header".to_string()))?,
+    ) as usize;
+
+    let feature_count = u64::from_le_bytes(
+        bytes[8..16]
+            .try_into()
+            .map_err(|_| AppError::InvalidData("Invalid feature count header".to_string()))?,
+    ) as usize;
+
+    let expected_values = sequence_length
+        .checked_mul(feature_count)
+        .ok_or_else(|| AppError::InvalidData("Dynamic sequence dimensions overflow".to_string()))?;
+
+    let expected_bytes = 16usize
+        .checked_add(expected_values.checked_mul(4).ok_or_else(|| {
+            AppError::InvalidData("Dynamic sequence byte size overflow".to_string())
+        })?)
+        .ok_or_else(|| AppError::InvalidData("Dynamic sequence byte size overflow".to_string()))?;
+
+    if bytes.len() != expected_bytes {
+        return Err(AppError::InvalidData(format!(
+            "Invalid dynamic sequence blob size: expected {}, got {}",
+            expected_bytes,
+            bytes.len()
+        )));
+    }
+
+    let mut sequence = Vec::with_capacity(sequence_length);
+    let mut offset = 16;
+
+    for _ in 0..sequence_length {
+        let mut timestep = Vec::with_capacity(feature_count);
+
+        for _ in 0..feature_count {
+            let value =
+                f32::from_le_bytes(bytes[offset..offset + 4].try_into().map_err(|_| {
+                    AppError::InvalidData("Invalid dynamic feature value".to_string())
+                })?);
+
+            timestep.push(value);
+            offset += 4;
+        }
+
+        sequence.push(timestep);
+    }
+
+    Ok(sequence)
 }

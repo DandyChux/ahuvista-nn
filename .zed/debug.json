@@ -9,154 +9,136 @@
 		"request": "launch",
 		"build": {
 			"command": "cargo",
-			"args": [
-				"build",
-				"--bin",
-				"ahuvista-prepare"
-			],
-			"cwd": "${ZED_WORKTREE_ROOT}"
+			"args": ["build", "--bin", "ahuvista", "--features", "prepare"],
+			"cwd": "${ZED_WORKTREE_ROOT}",
 		},
-		"program": "${ZED_WORKTREE_ROOT}/target/debug/ahuvista-prepare",
+		"program": "${ZED_WORKTREE_ROOT}/target/debug/ahuvista",
 		"args": [
+			"prepare",
+			"--data-dir",
+			"datasets",
+			"--database",
+			"ahuvista.db",
+			"--manifest",
+			"datasets/manifest.json",
+			"--clear",
 			"--verbose",
 		],
 		"cwd": "${ZED_WORKTREE_ROOT}",
 		"stopOnEntry": false,
 		"env": {
 			"RUST_LOG": "debug,ahuvista_nn=trace",
-			"RUST_BACKTRACE": "1"
-		}
+			"RUST_BACKTRACE": "1",
+		},
 	},
 	{
 		"adapter": "CodeLLDB",
-		"label": "Debug Training (Tabular)",
+		"label": "Debug Train",
 		"request": "launch",
 		"build": {
 			"command": "cargo",
-			"args": [
-				"build",
-				"--bin",
-				"ahuvista-train"
-			],
-			"cwd": "${ZED_WORKTREE_ROOT}"
+			"args": ["build", "--bin", "ahuvista", "--features", "train"],
+			"cwd": "${ZED_WORKTREE_ROOT}",
 		},
-		"program": "${ZED_WORKTREE_ROOT}/target/debug/ahuvista-train",
+		"program": "${ZED_WORKTREE_ROOT}/target/debug/ahuvista",
 		"args": [
-			"--modalities",
-			"tabular",
-			"--verbose"
+			"train",
+			"--database",
+			"ahuvista.db",
+			"--output-dir",
+			"models",
+			"--epochs",
+			"1",
+			"--batch-size",
+			"512",
+			"--no-privacy",
+			"--verbose",
 		],
 		"cwd": "${ZED_WORKTREE_ROOT}",
 		"stopOnEntry": false,
 		"env": {
 			"RUST_LOG": "debug,ahuvista_nn=trace",
-			"RUST_BACKTRACE": "1"
-		}
+			"RUST_BACKTRACE": "1",
+		},
 	},
 	{
 		"adapter": "CodeLLDB",
-		"label": "Debug Training (Temporal)",
+		"label": "Debug Train with Config",
 		"request": "launch",
 		"build": {
 			"command": "cargo",
-			"args": [
-				"build",
-				"--bin",
-				"ahuvista-train"
-			],
-			"cwd": "${ZED_WORKTREE_ROOT}"
+			"args": ["build", "--bin", "ahuvista", "--features", "train"],
+			"cwd": "${ZED_WORKTREE_ROOT}",
 		},
-		"program": "${ZED_WORKTREE_ROOT}/target/debug/ahuvista-train",
+		"program": "${ZED_WORKTREE_ROOT}/target/debug/ahuvista",
 		"args": [
-			"--modalities",
-			"temporal",
-			"--verbose"
+			"train",
+			"--config",
+			"config.json",
+			"--database",
+			"ahuvista.db",
+			"--output-dir",
+			"models",
+			"--verbose",
 		],
 		"cwd": "${ZED_WORKTREE_ROOT}",
 		"stopOnEntry": false,
 		"env": {
-			"RUST_LOG": "debug,ahuvista_nn=trace",
-			"RUST_BACKTRACE": "1"
-		}
+			"RUST_LOG": "trace",
+			"RUST_BACKTRACE": "full",
+			"RUST_MIN_STACK": "8388608",
+		},
 	},
 	{
 		"adapter": "CodeLLDB",
-		"label": "Debug Training (Text)",
+		"label": "Debug Predict",
 		"request": "launch",
 		"build": {
 			"command": "cargo",
-			"args": [
-				"build",
-				"--bin",
-				"ahuvista-train"
-			],
-			"cwd": "${ZED_WORKTREE_ROOT}"
+			"args": ["build", "--bin", "ahuvista", "--features", "predict"],
+			"cwd": "${ZED_WORKTREE_ROOT}",
 		},
-		"program": "${ZED_WORKTREE_ROOT}/target/debug/ahuvista-train",
+		"program": "${ZED_WORKTREE_ROOT}/target/debug/ahuvista",
 		"args": [
-			"--modalities",
-			"text",
-			"--verbose"
-		],
-		"cwd": "${ZED_WORKTREE_ROOT}",
-		"stopOnEntry": false,
-		"env": {
-			"RUST_LOG": "debug,ahuvista_nn=trace",
-			"RUST_BACKTRACE": "1"
-		}
-	},
-	{
-		"adapter": "CodeLLDB",
-		"label": "Debug Training (Image)",
-		"request": "launch",
-		"build": {
-			"command": "cargo",
-			"args": [
-				"build",
-				"--bin",
-				"ahuvista-train"
-			],
-			"cwd": "${ZED_WORKTREE_ROOT}"
-		},
-		"program": "${ZED_WORKTREE_ROOT}/target/debug/ahuvista-train",
-		"args": [
-			"--modalities",
-			"image",
-			"--verbose"
-		],
-		"cwd": "${ZED_WORKTREE_ROOT}",
-		"stopOnEntry": false,
-		"env": {
-			"RUST_LOG": "debug,ahuvista_nn=trace",
-			"RUST_BACKTRACE": "1"
-		}
-	},
-	{
-		"adapter": "CodeLLDB",
-		"label": "Debug Prediction",
-		"request": "launch",
-		"build": {
-			"command": "cargo",
-			"args": [
-				"build",
-				"--bin",
-				"ahuvista-predict"
-			],
-			"cwd": "${ZED_WORKTREE_ROOT}"
-		},
-		"program": "${ZED_WORKTREE_ROOT}/target/debug/ahuvista-predict",
-		"args": [
+			"predict",
 			"--model",
-			"path/to/model.bin",
+			"models/maternal-risk.ahv",
 			"--input",
-			"path/to/input.json"
+			"input.json",
+			"--output",
+			"prediction.json",
+			"--verbose",
 		],
 		"cwd": "${ZED_WORKTREE_ROOT}",
 		"stopOnEntry": false,
 		"env": {
-			"RUST_LOG": "debug",
-			"RUST_BACKTRACE": "1"
-		}
+			"RUST_LOG": "debug,ahuvista_nn=trace",
+			"RUST_BACKTRACE": "1",
+		},
+	},
+	{
+		"adapter": "CodeLLDB",
+		"label": "Debug Serve",
+		"request": "launch",
+		"build": {
+			"command": "cargo",
+			"args": ["build", "--bin", "ahuvista", "--features", "serve"],
+			"cwd": "${ZED_WORKTREE_ROOT}",
+		},
+		"program": "${ZED_WORKTREE_ROOT}/target/debug/ahuvista",
+		"args": [
+			"serve",
+			"--model",
+			"models/maternal-risk.ahv",
+			"--bind",
+			"127.0.0.1:8080",
+		],
+		"cwd": "${ZED_WORKTREE_ROOT}",
+		"stopOnEntry": false,
+		"env": {
+			"RUST_LOG": "debug,ahuvista_nn=trace",
+			"RUST_BACKTRACE": "1",
+		},
 	},
 	{
 		"adapter": "CodeLLDB",
@@ -164,28 +146,21 @@
 		"request": "launch",
 		"build": {
 			"command": "cargo",
-			"args": [
-				"test",
-				"--no-run",
-				"--lib"
-			],
-			"cwd": "${ZED_WORKTREE_ROOT}"
+			"args": ["test", "--no-run", "--lib"],
+			"cwd": "${ZED_WORKTREE_ROOT}",
 		},
 		"program": "${ZED_WORKTREE_ROOT}/target/debug/deps/ahuvista_nn-${ZED_RANDOM}",
-		"args": [
-			"models::",
-			"--nocapture"
-		],
+		"args": ["models::", "--nocapture"],
 		"cwd": "${ZED_WORKTREE_ROOT}",
 		"stopOnEntry": false,
 		"env": {
 			"RUST_LOG": "debug",
-			"RUST_BACKTRACE": "1"
-		}
+			"RUST_BACKTRACE": "1",
+		},
 	},
 	{
 		"adapter": "CodeLLDB",
-		"label": "Debug Training (Release Mode)",
+		"label": "Debug Train Release",
 		"request": "launch",
 		"build": {
 			"command": "cargo",
@@ -193,76 +168,34 @@
 				"build",
 				"--release",
 				"--bin",
-				"ahuvista-train"
+				"ahuvista",
+				"--features",
+				"train",
 			],
-			"cwd": "${ZED_WORKTREE_ROOT}"
+			"cwd": "${ZED_WORKTREE_ROOT}",
 		},
-		"program": "${ZED_WORKTREE_ROOT}/target/release/ahuvista-train",
+		"program": "${ZED_WORKTREE_ROOT}/target/release/ahuvista",
 		"args": [
+			"train",
 			"--config",
-			"config.json"
+			"config.json",
+			"--database",
+			"ahuvista.db",
+			"--output-dir",
+			"models",
 		],
 		"cwd": "${ZED_WORKTREE_ROOT}",
 		"stopOnEntry": false,
 		"env": {
 			"RUST_LOG": "info",
-			"RUST_BACKTRACE": "1"
-		}
-	},
-	{
-		"adapter": "CodeLLDB",
-		"label": "Debug Training (Verbose Logging)",
-		"request": "launch",
-		"build": {
-			"command": "cargo",
-			"args": [
-				"build",
-				"--bin",
-				"ahuvista-train"
-			],
-			"cwd": "${ZED_WORKTREE_ROOT}"
+			"RUST_BACKTRACE": "1",
 		},
-		"program": "${ZED_WORKTREE_ROOT}/target/debug/ahuvista-train",
-		"args": [
-			"--config",
-			"config.json"
-		],
-		"cwd": "${ZED_WORKTREE_ROOT}",
-		"stopOnEntry": false,
-		"env": {
-			"RUST_LOG": "trace",
-			"RUST_BACKTRACE": "full",
-			"RUST_MIN_STACK": "8388608"
-		}
 	},
 	{
 		"adapter": "CodeLLDB",
 		"label": "Attach to Running Process",
 		"request": "attach",
 		"pid": "${ZED_PICK_PID}",
-		"stopOnEntry": false
+		"stopOnEntry": false,
 	},
-	{
-		"adapter": "CodeLLDB",
-		"label": "Train Tabular Model",
-		"request": "launch",
-		"program": "$ZED_WORKTREE_ROOT/target/debug/binary",
-		"build": {
-			"command": "cargo",
-			"args": [
-				"run",
-				"--release",
-				"--bin",
-				"ahuvista-train",
-				"--",
-				"--modalities",
-				"tabular",
-				"--epochs",
-				"20",
-				"--batch-size",
-				"32",
-				"--verbose"
-			]
-		}
-	}
 ]

@@ -1,5 +1,4 @@
-use crate::core::{Activation, Layer, Module};
-use crate::utils::{sigmoid, sigmoid_derivative, tanh, tanh_derivative};
+use crate::core::{Activation, Layer, Module, sigmoid, sigmoid_derivative, tanh, tanh_derivative};
 use rand::Rng;
 
 /// A single Long Short-Term Memory (LSTM) layer.

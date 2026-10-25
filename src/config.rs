@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
-use std::{collections::HashSet, fs, path::PathBuf, sync::LazyLock};
+use std::{collections::HashSet, fs, path::PathBuf};
 
-use crate::utils::error::AppResult;
+use crate::error::AppResult;
 
 /// Stores all configuration settings for the application.
 #[derive(Debug, Clone)]
@@ -14,9 +14,7 @@ pub struct Settings {
     pub training: TrainingParams,
 
     // Model settings
-    pub tabular_hidden_sizes: Vec<usize>,
-    pub temporal_hidden_size: usize,
-    pub text_embedding_dim: usize,
+    pub model: ModelParams,
 
     // Modality settings
     pub modality_config: ModalityConfig,
@@ -35,12 +33,10 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             data_dir: PathBuf::from("datasets"),
-            patient_id_column: String::from("PatientID"),
+            patient_id_column: String::from("subject_id"),
             training: TrainingParams::default(),
-            tabular_hidden_sizes: vec![128, 64],
-            temporal_hidden_size: 128,
-            text_embedding_dim: 128,
-            modality_config: ModalityConfig::all(),
+            model: ModelParams::default(),
+            modality_config: ModalityConfig::builder().use_sequence(true).use_text(true).build(),
         }
     }
 }
@@ -48,45 +44,35 @@ impl Default for Settings {
 /// Configuration for which modalities to enable in the fusion network
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModalityConfig {
-    pub use_tabular: bool,
-    pub use_temporal: bool,
+    pub use_sequence: bool,
     pub use_text: bool,
     pub use_image: bool,
 }
 
 impl ModalityConfig {
-    /// Create a config with all modalities enabled
-    pub fn all() -> Self {
-        Self {
-            use_tabular: true,
-            use_temporal: true,
-            use_text: true,
-            use_image: true,
-        }
+    pub fn builder() -> ModalityConfigBuilder {
+        ModalityConfigBuilder::default()
     }
 
-    /// Create a config with only specified modalities
+    pub fn default() -> Self {
+        Self::builder().build()
+    }
+
     pub fn from_names(names: &[&str]) -> Self {
         let enabled: HashSet<&str> = names.iter().copied().collect();
+
         Self {
-            use_tabular: enabled.contains("tabular"),
-            use_temporal: enabled.contains("temporal"),
+            use_sequence: enabled.contains("sequence"),
             use_text: enabled.contains("text"),
             use_image: enabled.contains("image"),
         }
     }
 
-    /// Get the number of enabled modalities
     pub fn enabled_count(&self) -> usize {
-        [
-            self.use_tabular,
-            self.use_temporal,
-            self.use_text,
-            self.use_image,
-        ]
-        .iter()
-        .filter(|&&x| x)
-        .count()
+        [self.use_sequence, self.use_text, self.use_image]
+            .iter()
+            .filter(|&&enabled| enabled)
+            .count()
     }
 
     /// Validate that at least one modality is enabled
@@ -101,21 +87,56 @@ impl ModalityConfig {
     /// Get list of enabled modality names
     pub fn enabled_modalities(&self) -> Vec<&str> {
         let mut modalities = Vec::new();
-        if self.use_tabular {
-            modalities.push("tabular");
+
+        if self.use_sequence {
+            modalities.push("sequence");
         }
-        if self.use_temporal {
-            modalities.push("temporal");
-        }
+
         if self.use_text {
             modalities.push("text");
         }
+
         if self.use_image {
             modalities.push("image");
         }
+
         modalities
     }
 }
+
+/// Builder for configuring enabled modalities.
+#[derive(Debug, Clone, Default)]
+pub struct ModalityConfigBuilder {
+    use_sequence: bool,
+    use_text: bool,
+    use_image: bool,
+}
+
+impl ModalityConfigBuilder {
+    pub fn use_sequence(mut self, enabled: bool) -> Self {
+        self.use_sequence = enabled;
+        self
+    }
+
+    pub fn use_text(mut self, enabled: bool) -> Self {
+        self.use_text = enabled;
+        self
+    }
+
+    pub fn use_image(mut self, enabled: bool) -> Self {
+        self.use_image = enabled;
+        self
+    }
+
+    pub fn build(self) -> ModalityConfig {
+        ModalityConfig {
+            use_sequence: self.use_sequence,
+            use_text: self.use_text,
+            use_image: self.use_image,
+        }
+    }
+}
+
 
 /// Full application configuration loaded from JSON file
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -132,9 +153,7 @@ pub struct DataPaths {
     pub data_dir: String,
     pub patient_id_column: String,
 
-    // Optional paths - only used if corresponding modality is enabled
-    pub tabular_files: Option<Vec<String>>,
-    pub temporal_files: Option<Vec<String>>,
+    pub sequence_files: Option<Vec<String>>,
     pub text_files: Option<Vec<String>>,
     pub image_files: Option<Vec<String>>,
 }
@@ -144,8 +163,7 @@ impl Default for DataPaths {
         Self {
             data_dir: "datasets".to_string(),
             patient_id_column: "PatientID".to_string(),
-            tabular_files: Some(vec!["tabular_data.csv".to_string()]),
-            temporal_files: Some(vec!["temporal_data.csv".to_string()]),
+            sequence_files: None,
             text_files: Some(vec!["text_data.txt".to_string()]),
             image_files: Some(vec!["images/".to_string()]),
         }
@@ -207,13 +225,9 @@ impl Default for TrainingParams {
 /// Model architecture parameters
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelParams {
-    // Tabular network
-    pub tabular_hidden_sizes: Vec<usize>,
-    pub tabular_output_size: usize,
-
-    // Temporal network
-    pub temporal_hidden_size: usize,
-    pub temporal_output_size: usize,
+    // Sequence network
+    pub sequence_hidden_size: usize,
+    pub sequence_output_size: usize,
 
     // Text network
     pub text_embedding_dim: usize,
@@ -232,16 +246,17 @@ pub struct ModelParams {
 impl Default for ModelParams {
     fn default() -> Self {
         Self {
-            tabular_hidden_sizes: vec![64, 32],
-            tabular_output_size: 16,
-            temporal_hidden_size: 32,
-            temporal_output_size: 16,
+            sequence_hidden_size: 32,
+            sequence_output_size: 16,
+
             text_embedding_dim: 50,
             text_hidden_size: 32,
             text_max_vocab: 5000,
+
             image_channels: 3,
             image_height: 224,
             image_width: 224,
+
             classifier_hidden_sizes: vec![64, 32],
         }
     }
@@ -250,7 +265,7 @@ impl Default for ModelParams {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            modalities: ModalityConfig::all(),
+            modalities: ModalityConfig::default(),
             data_paths: DataPaths::default(),
             training: TrainingParams::default(),
             model: ModelParams::default(),
@@ -263,10 +278,8 @@ impl From<AppConfig> for Settings {
         Settings {
             data_dir: PathBuf::from(config.data_paths.data_dir),
             patient_id_column: config.data_paths.patient_id_column,
-            training: config.training, // Just move it directly!
-            tabular_hidden_sizes: config.model.tabular_hidden_sizes,
-            temporal_hidden_size: config.model.temporal_hidden_size,
-            text_embedding_dim: config.model.text_embedding_dim,
+            training: config.training,
+            model: config.model,
             modality_config: config.modalities,
         }
     }

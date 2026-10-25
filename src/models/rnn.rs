@@ -1,8 +1,6 @@
-use crate::{
-    core::{LSTMLayer, Layer, Module},
-    utils::{tanh, tanh_derivative},
-};
 use rand::Rng;
+
+use crate::core::{tanh, tanh_derivative};
 
 /// Simple RNN cell for processing sequence data.
 ///
@@ -42,7 +40,7 @@ impl SimpleRnnCell {
     /// * `input_size` - Size of input vectors
     /// * `hidden_size` - Size of hidden state vectors
     pub fn new(input_size: usize, hidden_size: usize) -> Self {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
 
         // Xavier/Glorot initialization scaled for tanh activation
         let ih_scale = (6.0 / (input_size + hidden_size) as f32).sqrt();
@@ -147,112 +145,5 @@ impl SimpleRnnCell {
     pub fn reset_state(&mut self) {
         self.cached_inputs.clear();
         self.cached_hiddens.clear();
-    }
-}
-
-/// Network for processing temporal (time series) data.
-///
-/// Uses a simple RNN to process sequential data and extract meaningful features.
-#[derive(Debug)]
-pub struct TemporalNet {
-    lstm_layer: LSTMLayer,
-    // Optional: A final linear layer to transform the LSTM output
-    output_layer: Layer,
-}
-
-impl TemporalNet {
-    pub fn new(input_size: usize, hidden_size: usize, output_size: usize) -> Self {
-        Self {
-            lstm_layer: LSTMLayer::new(input_size, hidden_size),
-            output_layer: Layer::new_linear(output_size, hidden_size), // Takes final hidden state as input
-        }
-    }
-
-    /// Get all parameters from the network.
-    pub fn get_parameters(&self) -> Vec<f32> {
-        let mut params = self.lstm_layer.get_parameters();
-        params.extend(self.output_layer.get_parameters());
-        params
-    }
-
-    /// Set all parameters in the network.
-    /// Returns the number of parameters consumed.
-    pub fn set_parameters(&mut self, params: &[f32]) -> Result<usize, Box<dyn std::error::Error>> {
-        let mut offset = 0;
-        offset += self.lstm_layer.set_parameters(&params[offset..])?;
-        offset += self.output_layer.set_parameters(&params[offset..])?;
-        Ok(offset)
-    }
-}
-
-impl Module<Vec<Vec<f32>>, Vec<f32>> for TemporalNet {
-    fn forward(&mut self, sequence: Vec<Vec<f32>>) -> Vec<f32> {
-        // Process the sequence through the LSTM layer
-        let final_hidden_state = self.lstm_layer.forward_sequence(&sequence);
-
-        // Pass the final state through the output layer
-        self.output_layer.forward(final_hidden_state.clone())
-    }
-
-    fn backward(&mut self, grad_output: Vec<f32>) -> Vec<Vec<f32>> {
-        // Backpropagate through the output layer first
-        let grad_hidden_state = self.output_layer.backward(grad_output);
-
-        // Then, backpropagate through the entire sequence in the LSTM layer
-        let grad_sequence = self.lstm_layer.backward_sequence(&grad_hidden_state);
-
-        grad_sequence
-    }
-
-    fn zero_grad(&mut self) {
-        self.lstm_layer.input_gate.zero_grad();
-        self.lstm_layer.forget_gate.zero_grad();
-        self.lstm_layer.output_gate.zero_grad();
-        self.lstm_layer.cell_gate.zero_grad();
-        self.output_layer.zero_grad();
-    }
-
-    fn gradients(&self) -> Vec<f32> {
-        // Collect gradients from all layers
-        let mut grads = Vec::new();
-        grads.extend(self.lstm_layer.input_gate.gradients());
-        grads.extend(self.lstm_layer.forget_gate.gradients());
-        grads.extend(self.lstm_layer.output_gate.gradients());
-        grads.extend(self.lstm_layer.cell_gate.gradients());
-        grads.extend(self.output_layer.gradients());
-        grads
-    }
-
-    fn apply_gradients(&mut self, gradients: &[f32], lr: f32) {
-        // Calculate sizes for each layer's gradients
-        let input_gate_size = self.lstm_layer.input_gate.gradients().len();
-        let forget_gate_size = self.lstm_layer.forget_gate.gradients().len();
-        let output_gate_size = self.lstm_layer.output_gate.gradients().len();
-        let cell_gate_size = self.lstm_layer.cell_gate.gradients().len();
-
-        let mut offset = 0;
-
-        // Apply gradients to each layer
-        self.lstm_layer
-            .input_gate
-            .apply_gradients(&gradients[offset..offset + input_gate_size], lr);
-        offset += input_gate_size;
-
-        self.lstm_layer
-            .forget_gate
-            .apply_gradients(&gradients[offset..offset + forget_gate_size], lr);
-        offset += forget_gate_size;
-
-        self.lstm_layer
-            .output_gate
-            .apply_gradients(&gradients[offset..offset + output_gate_size], lr);
-        offset += output_gate_size;
-
-        self.lstm_layer
-            .cell_gate
-            .apply_gradients(&gradients[offset..offset + cell_gate_size], lr);
-        offset += cell_gate_size;
-
-        self.output_layer.apply_gradients(&gradients[offset..], lr);
     }
 }

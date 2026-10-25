@@ -40,8 +40,10 @@ logs/
 *.swp
 *~
 
-# Ignore datasets directory (must provide your own data)
-datasets/
+# Ignore datasets directories (must provide your own data)
+datasets/*
+!datasets/
+!datasets/manifest.example.json
 
 # SQLite database files
 *.db

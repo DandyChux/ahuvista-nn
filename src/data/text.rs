@@ -4,7 +4,7 @@
 //! text data such as medical notes, patient descriptions, or symptoms.
 
 use crate::data::DataLoader;
-use crate::utils::error::AppResult;
+use crate::error::AppResult;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
@@ -12,6 +12,9 @@ use std::path::Path;
 
 /// Structure for handling text data
 pub struct TextData {
+    /// Patient identifiers aligned with documents and token_sequences.
+    pub patient_ids: Vec<String>,
+
     /// Original documents
     pub documents: Vec<String>,
 
@@ -35,6 +38,7 @@ impl TextData {
     /// Create a new empty TextData instance
     pub fn new() -> Self {
         TextData {
+            patient_ids: Vec::new(),
             documents: Vec::new(),
             token_sequences: Vec::new(),
             vocab: HashMap::new(),
@@ -75,6 +79,7 @@ impl TextData {
     /// Result containing TextData or an error
     pub fn from_documents(documents: Vec<String>, max_vocab_size: usize) -> AppResult<Self> {
         let mut text_data = TextData {
+            patient_ids: (0..documents.len()).map(|index| format!("P{:02}", index)).collect(),
             documents: documents.clone(),
             token_sequences: Vec::new(),
             vocab: HashMap::new(),

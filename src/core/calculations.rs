@@ -1,6 +1,4 @@
-pub mod error;
-
-use rand::Rng;
+// use rand::Rng;
 
 pub fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())

@@ -4,64 +4,27 @@
 		"description": "FHIR to Ahuvista-NN feature mapping for maternal health prediction",
 		"based_on_training_data": "Maternal Health Risk Assessment Dataset"
 	},
-	"tabular_features": [
+	"static_features": [
 		{
-			"loinc_code": "30525-0",
-			"snomed_code": "424144002",
+			"system": "http://loinc.org",
+			"code": "8302-2",
 			"feature_index": 0,
-			"feature_name": "Age",
-			"default_value": 25.0,
-			"source": "Patient.birthDate (calculated)"
-		},
-		{
-			"loinc_code": "8480-6",
-			"feature_index": 1,
-			"feature_name": "Systolic BP",
-			"default_value": 120.0,
+			"feature_name": "height",
+			"default_value": 0.0,
 			"unit_conversion": null
-		},
-		{
-			"loinc_code": "8462-4",
-			"feature_index": 2,
-			"feature_name": "Diastolic BP",
-			"default_value": 80.0
-		},
-		{
-			"loinc_code": "2339-0",
-			"feature_index": 3,
-			"feature_name": "Blood Sugar (Glucose)",
-			"default_value": 100.0,
-			"unit_conversion": {
-				"from_unit": "mmol/L",
-				"to_unit": "mg/dL",
-				"multiplier": 18.0
-			}
-		},
-		{
-			"loinc_code": "8310-5",
-			"feature_index": 4,
-			"feature_name": "Body Temperature",
-			"default_value": 98.6,
-			"unit_conversion": {
-				"from_unit": "Cel",
-				"to_unit": "[degF]",
-				"multiplier": 1.8,
-				"offset": 32.0
-			}
-		},
-		{
-			"loinc_code": "39156-5",
-			"feature_index": 5,
-			"feature_name": "BMI",
-			"default_value": 24.0
-		},
-		{
-			"loinc_code": "8867-4",
-			"feature_index": 6,
-			"feature_name": "Heart Rate",
-			"default_value": 75.0
 		}
 	],
+	"dynamic_features": [
+		{
+			"system": "http://loinc.org",
+			"code": "8480-6",
+			"feature_index": 0,
+			"feature_name": "systolic-blood-pressure",
+			"default_value": 0.0,
+			"unit_conversion": null
+		}
+	],
+	"imaging_study_types": ["LP29684-5"],
 	"condition_flags": [
 		{
 			"snomed_code": "73211009",
@@ -87,31 +50,6 @@
 			"feature_name": "Previous Pregnancy Complications"
 		}
 	],
-	"temporal_features": {
-		"feature_codes": [
-			"8480-6",
-			"8462-4",
-			"8310-5",
-			"8867-4",
-			"9279-1"
-		],
-		"feature_names": [
-			"Systolic BP",
-			"Diastolic BP",
-			"Temperature",
-			"Heart Rate",
-			"Respiratory Rate"
-		],
-		"max_sequence_length": 10
-	},
-	"text_document_types": [
-		"11488-4",
-		"18842-5",
-		"34117-2"
-	],
-	"imaging_study_types": [
-		"LP29684-5"
-	],
-	"expected_tabular_size": 11,
-	"expected_temporal_feature_count": 5
+	"text_document_types": ["11488-4", "18842-5", "34117-2"],
+	"max_sequence_length": 128
 }

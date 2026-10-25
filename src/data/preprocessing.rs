@@ -1,124 +1,95 @@
 //! Data preprocessing and splitting utilities
 
-use super::TabularData;
+use crate::{
+    data::{FeatureStats, PreparedDataset},
+    error::{AppError, AppResult},
+    models::PatientSequence,
+};
 use ndarray::Array3;
 use tracing::info;
 
-/// Split multi-modal data with sample weights into training and validation sets
-pub fn split_data_with_weights(
-    tabular_data: &[Vec<f32>],
-    temporal_data: &[Vec<Vec<f32>>],
-    text_data: &[Vec<usize>],
-    image_data: &[Array3<f32>],
-    targets: &[f32],
-    weights: &[f32],
+pub fn split_dataset(
+    dataset: &PreparedDataset,
     train_ratio: f32,
-) -> (
+) -> AppResult<(PreparedDataset, PreparedDataset)> {
+    if !(0.0..=1.0).contains(&train_ratio) {
+        return Err(AppError::InvalidData(format!(
+            "Train ratio must be between 0 and 1, got {}",
+            train_ratio
+        )));
+    }
+
+    let split_index = (dataset.len() as f32 * train_ratio).floor() as usize;
+
+    dataset.split_at(split_index)
+}
+
+fn split_vec<T: Clone>(values: &[T], split_index: usize) -> (Vec<T>, Vec<T>) {
     (
-        Vec<Vec<f32>>,
-        Vec<Vec<Vec<f32>>>,
-        Vec<Vec<usize>>,
-        Vec<Array3<f32>>,
-    ),
-    (
-        Vec<Vec<f32>>,
-        Vec<Vec<Vec<f32>>>,
-        Vec<Vec<usize>>,
-        Vec<Array3<f32>>,
-    ),
-    Vec<f32>,
-    Vec<f32>,
-    Vec<f32>,
-    Vec<f32>,
-) {
-    let total_samples = targets.len();
-    let train_size = (total_samples as f32 * train_ratio) as usize;
-    info!("TRAINING SIZE: {}", train_size);
-    info!("TABULAR DATA LENGTH: {}", tabular_data.len());
-    info!("TEMPORAL DATA LENGTH: {}", temporal_data.len());
-    info!("TEXT DATA LENGTH: {}", text_data.len());
-    info!("IMAGE DATA LENGTH: {}", image_data.len());
-
-    // Split tabular data (only if it has data)
-    let (train_tabular, val_tabular) = if !tabular_data.is_empty() {
-        (
-            tabular_data[0..train_size].to_vec(),
-            tabular_data[train_size..].to_vec(),
-        )
-    } else {
-        (vec![], vec![])
-    };
-
-    // Split temporal data (only if it has data)
-    let (train_temporal, val_temporal) = if !temporal_data.is_empty() {
-        (
-            temporal_data[0..train_size].to_vec(),
-            temporal_data[train_size..].to_vec(),
-        )
-    } else {
-        (vec![], vec![])
-    };
-
-    // Split text data (only if it has data)
-    let (train_text, val_text) = if !text_data.is_empty() {
-        (
-            text_data[0..train_size].to_vec(),
-            text_data[train_size..].to_vec(),
-        )
-    } else {
-        (vec![], vec![])
-    };
-
-    // Split image data (only if it has data)
-    let (train_image, val_image) = if !image_data.is_empty() {
-        (
-            image_data[0..train_size].to_vec(),
-            image_data[train_size..].to_vec(),
-        )
-    } else {
-        (vec![], vec![])
-    };
-
-    // Split targets
-    let train_targets = targets[0..train_size].to_vec();
-    let val_targets = targets[train_size..].to_vec();
-
-    // Split weights
-    let train_weights = weights[0..train_size].to_vec();
-    let val_weights = weights[train_size..].to_vec();
-
-    (
-        (train_tabular, train_temporal, train_text, train_image),
-        (val_tabular, val_temporal, val_text, val_image),
-        train_targets,
-        val_targets,
-        train_weights,
-        val_weights,
+        values[..split_index].to_vec(),
+        values[split_index..].to_vec(),
     )
 }
 
-/// Extract patient demographic strata from tabular data
-pub fn extract_patient_strata(tabular_data: &TabularData) -> Vec<String> {
-    // This is a placeholder function - in a real implementation,
-    // you would extract demographic features from the tabular data
-    // to determine each patient's stratum
+fn split_slice<T: Clone>(values: &[T], split_index: usize) -> (Vec<T>, Vec<T>) {
+    split_vec(values, split_index)
+}
 
-    let mut strata = Vec::with_capacity(tabular_data.data.len());
+/// Extract demographic strata from unified patient sequences.
+///
+/// This currently uses deterministic placeholder strata. Replace the
+/// feature-index logic once the static feature schema is finalized.
+pub fn extract_patient_strata(sequences: &[PatientSequence]) -> Vec<String> {
+    sequences
+        .iter()
+        .enumerate()
+        .map(|(index, _)| match index % 4 {
+            0 => "urban_young".to_string(),
+            1 => "urban_old".to_string(),
+            2 => "rural_young".to_string(),
+            _ => "rural_old".to_string(),
+        })
+        .collect()
+}
 
-    for (i, _) in tabular_data.data.iter().enumerate() {
-        // This is just a dummy implementation
-        let stratum = if i % 4 == 0 {
-            "urban_young".to_string()
-        } else if i % 4 == 1 {
-            "urban_old".to_string()
-        } else if i % 4 == 2 {
-            "rural_young".to_string()
-        } else {
-            "rural_old".to_string()
+/// Normalize static and dynamic features in-place.
+pub fn normalize_sequences(
+    sequences: &mut [PatientSequence],
+    static_stats: &[FeatureStats],
+    dynamic_stats: &[FeatureStats],
+) {
+    for sequence in sequences {
+        normalize_static_features(&mut sequence.static_features, static_stats);
+
+        normalize_dynamic_features(&mut sequence.dynamic_features, dynamic_stats);
+    }
+}
+
+fn normalize_static_features(features: &mut [f32], stats: &[FeatureStats]) {
+    for (index, feature) in features.iter_mut().enumerate() {
+        let Some(stat) = stats.get(index) else {
+            continue;
         };
 
-        strata.push(stratum);
+        *feature = normalize_value(*feature, stat);
     }
+}
 
-    strata
+fn normalize_dynamic_features(sequence: &mut [Vec<f32>], stats: &[FeatureStats]) {
+    for timestep in sequence {
+        for (index, feature) in timestep.iter_mut().enumerate() {
+            let Some(stat) = stats.get(index) else {
+                continue;
+            };
+
+            *feature = normalize_value(*feature, stat);
+        }
+    }
+}
+
+fn normalize_value(value: f32, stat: &FeatureStats) -> f32 {
+    match stat.std.is_finite() && stat.std > 1e-6 {
+        true => (value - stat.mean) / stat.std,
+        false => value - stat.mean,
+    }
 }

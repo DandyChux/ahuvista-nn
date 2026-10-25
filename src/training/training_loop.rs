@@ -41,9 +41,11 @@ pub fn train_model_with_weights(
 
     // Initialize Adam optimizer — determine parameter count from the gradient vector
     model.zero_grad();
+
     let num_params = model.gradients().len();
     let mut optimizer =
         Adam::with_weight_decay(num_params, config.learning_rate, config.weight_decay);
+
     info!(
         "Adam optimizer initialized: {} parameters, lr={}, weight_decay={}",
         num_params, config.learning_rate, config.weight_decay
@@ -53,11 +55,11 @@ pub fn train_model_with_weights(
 
     for epoch in 0..config.epochs {
         // Shuffle training data at the start of each epoch
-        train_loader.shuffle(train_weights);
+        train_loader.shuffle();
 
         // Training phase
         train_loader.reset();
-        let mut sample_idx = 0;
+
         let mut epoch_predictions: Vec<f32> = Vec::new();
         let mut epoch_targets: Vec<f32> = Vec::new();
         let mut epoch_logits: Vec<f32> = Vec::new();
@@ -79,49 +81,37 @@ pub fn train_model_with_weights(
 
             // Single-pass: forward, compute per-sample gradient, backward — no re-forward needed
             for i in 0..batch_size {
-                let sample_weight = if sample_idx < train_weights.len() {
-                    train_weights[sample_idx]
-                } else {
-                    1.0
-                };
-                sample_idx += 1;
+                let sample_weight = batch
+                    .indices
+                    .get(i)
+                    .and_then(|&index| train_weights.get(index))
+                    .copied()
+                    .unwrap_or(1.0);
 
-                // Prepare inputs
-                let tabular_input = if i < batch.tabular.len() {
-                    batch.tabular[i].clone()
-                } else {
-                    vec![]
-                };
+                let sequence_input = batch.sequences[i].clone();
 
-                let temporal_input = if i < batch.temporal.len() {
-                    batch.temporal[i].clone()
-                } else {
-                    vec![]
-                };
+                let text_input = batch
+                    .text
+                    .get(i)
+                    .cloned()
+                    .unwrap_or_else(|| vec![]);
 
-                let text_input = if i < batch.text.len() {
-                    batch.text[i].clone()
-                } else {
-                    vec![]
-                };
+                let image_input = batch
+                    .images
+                    .get(i)
+                    .and_then(|images| images.first())
+                    .cloned()
+                    .unwrap_or_else(|| ndarray::Array3::<f32>::zeros((0, 0, 0)));
 
-                let image_input = if i < batch.images.len() {
-                    batch.images[i].clone()
-                } else {
-                    ndarray::Array3::<f32>::zeros((0, 0, 0))
-                };
-
-                // Forward pass — cached activations are set for this sample
-                let logit_output =
-                    model.forward((tabular_input, temporal_input, text_input, image_input));
+                let logit_output = model.forward((sequence_input, text_input, image_input));
                 let logit = logit_output[0];
                 let target = batch.targets[i];
 
                 // Compute probability via sigmoid
-                let p = 1.0 / (1.0 + (-logit).exp());
+                let prob = 1.0 / (1.0 + (-logit).exp());
 
-                // BCE gradient for this sample: (p - target) * weight
-                let grad = (p - target) * sample_weight;
+                // BCE gradient for this sample: (prob - target) * weight
+                let grad = (prob - target) * sample_weight;
 
                 // Backward pass — accumulates gradients inside the model
                 model.backward(vec![grad]);
@@ -142,7 +132,7 @@ pub fn train_model_with_weights(
                 if epoch == 0 && total_batches == 1 && i < 3 {
                     debug!(
                         "Sample {}: logit={:.6}, prob={:.6}, target={}, loss_grad={:.6}",
-                        i, logit, p, target, grad
+                        i, logit, prob, target, grad
                     );
                 }
             }
@@ -227,6 +217,7 @@ pub fn train_model_with_weights(
             // Adam step with weight decay: needs current params for decoupled decay
             let current_params = model.get_all_parameters();
             let adam_updates = optimizer.step(&model_grads, &current_params);
+
             model.apply_gradients(&adam_updates, 1.0); // lr=1.0; Adam already includes the step size
 
             // Zero gradients after applying
@@ -301,32 +292,22 @@ pub fn evaluate_model_with_calibration(
             };
             sample_idx += 1;
 
-            // Prepare inputs
-            let tabular_input = if !batch.tabular.is_empty() {
-                batch.tabular[i].clone()
-            } else {
-                vec![] // Empty vector for disabled modality
-            };
+            let sequence_input = batch.sequences[i].clone();
 
-            let temporal_input = if !batch.temporal.is_empty() {
-                batch.temporal[i].clone()
-            } else {
-                vec![] // Empty sequence for disabled modality
-            };
+            let text_input = batch
+                .text
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| vec![]);
 
-            let text_input = if !batch.text.is_empty() {
-                batch.text[i].clone()
-            } else {
-                vec![] // Empty token sequence for disabled modality
-            };
+            let image_input = batch
+                .images
+                .get(i)
+                .and_then(|images| images.first())
+                .cloned()
+                .unwrap_or_else(|| ndarray::Array3::<f32>::zeros((0, 0, 0)));
 
-            let image_input = if !batch.images.is_empty() {
-                batch.images[i].clone()
-            } else {
-                ndarray::Array3::<f32>::zeros((0, 0, 0)) // Empty 3D array for disabled modality
-            };
-
-            let logit = model.forward((tabular_input, temporal_input, text_input, image_input))[0];
+            let logit = model.forward((sequence_input, text_input, image_input))[0];
 
             all_logits.push(logit);
             all_targets.push(batch.targets[i]);
@@ -463,33 +444,22 @@ pub fn evaluate_by_cause(
 
             sample_idx += 1;
 
-            let tabular_input = if !batch.tabular.is_empty() {
-                batch.tabular[i].clone()
-            } else {
-                vec![] // Empty vector for disabled modality
-            };
+            let sequence_input = batch.sequences[i].clone();
 
-            let temporal_input = if !batch.temporal.is_empty() {
-                batch.temporal[i].clone()
-            } else {
-                vec![] // Empty sequence for disabled modality
-            };
+            let text_input = batch
+                .text
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| vec![]);
 
-            let text_input = if !batch.text.is_empty() {
-                batch.text[i].clone()
-            } else {
-                vec![] // Empty token sequence for disabled modality
-            };
+            let image_input = batch
+                .images
+                .get(i)
+                .and_then(|images| images.first())
+                .cloned()
+                .unwrap_or_else(|| ndarray::Array3::<f32>::zeros((0, 0, 0)));
 
-            let image_input = if !batch.images.is_empty() {
-                batch.images[i].clone()
-            } else {
-                ndarray::Array3::<f32>::zeros((0, 0, 0)) // Empty 3D array for disabled modality
-            };
-
-            // Forward pass
-            let prediction =
-                model.forward((tabular_input, temporal_input, text_input, image_input))[0];
+            let prediction = model.forward((sequence_input, text_input, image_input))[0];
 
             // Compute loss
             let target = batch.targets[i];

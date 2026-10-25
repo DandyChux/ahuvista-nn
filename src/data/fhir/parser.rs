@@ -1,12 +1,24 @@
-use chrono::{NaiveDate, Utc};
+use chrono::{Datelike, NaiveDate, Utc};
+use std::collections::BTreeMap;
 
-use crate::{
-    core::PredictionInput,
-    data::{
-        mapping::{FhirMappingConfig, TabularFeatureMapping},
-        resources::{Bundle, CodeableConcept, ObservationResource, PatientResource},
+use crate::models::PatientSequence;
+
+use super::{
+    mapping::{FhirMappingConfig, StaticFeatureMapping},
+    resources::{
+        Bundle, CodeableConcept, Condition, DocumentReference, ImagingStudy, Observation, Patient,
+        Reference, Resource,
     },
 };
+use crate::error::FhirError;
+
+#[derive(Debug, Clone)]
+pub struct FhirPatientData {
+    pub patient_id: String,
+    pub sequence: PatientSequence,
+    pub text: Option<String>,
+    pub image_references: Vec<String>,
+}
 
 pub struct FhirParser {
     config: FhirMappingConfig,
@@ -17,125 +29,307 @@ impl FhirParser {
         Self { config }
     }
 
-    /// Main entry point: Bundle → PredictionInput
-    pub fn bundle_to_prediction_input(
-        &self,
-        bundle: &Bundle,
-    ) -> Result<PredictionInput, FhirError> {
-        // Extract resources by type
+    pub fn parse_bundle(&self, bundle: &Bundle) -> Result<FhirPatientData, FhirError> {
         let patient = self.extract_patient(bundle)?;
+
         let observations = self.extract_observations(bundle);
-        let documents = self.extract_documents(bundle);
         let conditions = self.extract_conditions(bundle);
+        let documents = self.extract_documents(bundle);
         let imaging = self.extract_imaging(bundle);
 
-        Ok(PredictionInput {
-            patient_id: patient.id.clone(),
-            tabular: Some(self.build_tabular_features(&patient, &observations, &conditions)?),
-            temporal: Some(self.build_temporal_features(&observations)?),
+        let patient_id = patient.id.clone().ok_or(FhirError::MissingPatient)?;
+
+        let static_features = self.build_static_features(&patient, &observations, &conditions)?;
+
+        let dynamic_features = self.build_dynamic_features(&observations)?;
+
+        Ok(FhirPatientData {
+            patient_id,
+            sequence: PatientSequence {
+                static_features,
+                dynamic_features,
+            },
             text: self.extract_text_content(&documents),
-            image_path: self.extract_image_reference(&imaging),
+            image_references: self.extract_image_references(&imaging),
         })
     }
 
-    fn build_tabular_features(
+    fn extract_patient(&self, bundle: &Bundle) -> Result<Patient, FhirError> {
+        self.resources(bundle)
+            .into_iter()
+            .find_map(|resource| match resource {
+                Resource::Patient(patient) => Some(patient),
+                _ => None,
+            })
+            .ok_or(FhirError::MissingPatient)
+    }
+
+    fn extract_observations(&self, bundle: &Bundle) -> Vec<Observation> {
+        self.resources(bundle)
+            .into_iter()
+            .filter_map(|resource| match resource {
+                Resource::Observation(observation) => Some(observation),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn extract_conditions(&self, bundle: &Bundle) -> Vec<Condition> {
+        self.resources(bundle)
+            .into_iter()
+            .filter_map(|resource| match resource {
+                Resource::Condition(condition) => Some(condition),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn extract_documents(&self, bundle: &Bundle) -> Vec<DocumentReference> {
+        self.resources(bundle)
+            .into_iter()
+            .filter_map(|resource| match resource {
+                Resource::DocumentReference(document) => Some(document),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn extract_imaging(&self, bundle: &Bundle) -> Vec<ImagingStudy> {
+        self.resources(bundle)
+            .into_iter()
+            .filter_map(|resource| match resource {
+                Resource::ImagingStudy(study) => Some(study),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn resources(&self, bundle: &Bundle) -> Vec<Resource> {
+        bundle
+            .entry
+            .as_ref()
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.resource.clone())
+            .collect()
+    }
+
+    fn build_static_features(
         &self,
-        patient: &PatientResource,
-        observations: &[ObservationResource],
-        conditions: &[ConditionResource],
+        patient: &Patient,
+        observations: &[Observation],
+        conditions: &[Condition],
     ) -> Result<Vec<f32>, FhirError> {
-        let mut features = vec![0.0; self.config.expected_tabular_size];
+        let mut features = vec![0.0; self.config.static_feature_count()];
 
-        // Age from birthdate
         if let Some(birth_date) = &patient.birth_date {
-            if let Ok(dob) = NaiveDate::parse_from_str(birth_date, "%Y-%m-%d") {
-                let age = calculate_age(dob);
-                // Assuming age is feature index 0
-                features[0] = age as f32;
-            }
-        }
-
-        // Map observations to features by LOINC code
-        for obs in observations {
-            if let Some(value) = self.extract_observation_value(obs) {
-                if let Some(mapping) = self.find_tabular_mapping(&obs.code) {
-                    let converted_value = self.convert_units(value, obs, &mapping);
-                    features[mapping.feature_index] = converted_value;
+            if let Ok(date) = NaiveDate::parse_from_str(birth_date, "%Y-%m-%d") {
+                if let Some(index) = self
+                    .config
+                    .static_features
+                    .iter()
+                    .find(|mapping| mapping.feature_name == "age")
+                    .map(|mapping| mapping.feature_index)
+                {
+                    features[index] = calculate_age(date) as f32;
                 }
             }
         }
 
-        // Map conditions to binary flags
+        for observation in observations {
+            let Some(value) = extract_observation_value(observation) else {
+                continue;
+            };
+
+            let Some(mapping) = self.find_static_mapping(&observation.code) else {
+                continue;
+            };
+
+            features[mapping.feature_index] = apply_conversion(value, observation, mapping);
+        }
+
         for condition in conditions {
-            if let Some(mapping) = self.find_condition_mapping(&condition.code) {
-                features[mapping.feature_index] = 1.0;
+            let Some((system, code)) = condition_code(condition) else {
+                continue;
+            };
+
+            for mapping in &self.config.condition_flags {
+                if mapping.matches(system.as_deref(), &code) {
+                    features[mapping.feature_index] = 1.0;
+                }
             }
         }
 
         Ok(features)
     }
 
-    fn build_temporal_features(
+    fn build_dynamic_features(
         &self,
-        observations: &[ObservationResource],
+        observations: &[Observation],
     ) -> Result<Vec<Vec<f32>>, FhirError> {
-        // Group observations by timestamp
-        let mut time_points: BTreeMap<String, Vec<f32>> = BTreeMap::new();
+        let feature_count = self.config.dynamic_feature_count();
 
-        for obs in observations {
-            let timestamp = obs
-                .effective_date_time
-                .as_ref()
-                .or(obs.effective_period.as_ref().and_then(|p| p.start.as_ref()));
+        if feature_count == 0 {
+            return Ok(Vec::new());
+        }
 
-            if let Some(ts) = timestamp {
-                if let Some(mapping_idx) = self.find_temporal_feature_index(&obs.code) {
-                    let entry = time_points
-                        .entry(ts.clone())
-                        .or_insert_with(|| vec![0.0; self.config.expected_temporal_feature_count]);
+        let mut points: BTreeMap<String, Vec<f32>> = BTreeMap::new();
 
-                    if let Some(value) = self.extract_observation_value(obs) {
-                        entry[mapping_idx] = value;
-                    }
+        for observation in observations {
+            let Some(timestamp) = observation_timestamp(observation) else {
+                continue;
+            };
+
+            let Some(mapping) = self.find_dynamic_mapping(&observation.code) else {
+                continue;
+            };
+
+            let Some(value) = extract_observation_value(observation) else {
+                continue;
+            };
+
+            let entry = points
+                .entry(timestamp)
+                .or_insert_with(|| vec![mapping.default_value; feature_count]);
+
+            entry[mapping.feature_index] = apply_conversion_dynamic(value, observation, mapping);
+        }
+
+        let mut sequence: Vec<Vec<f32>> = points.into_values().collect();
+
+        if sequence.len() > self.config.max_sequence_length {
+            let start = sequence.len() - self.config.max_sequence_length;
+            sequence = sequence.split_off(start);
+        }
+
+        Ok(sequence)
+    }
+
+    fn find_static_mapping(&self, code: &CodeableConcept) -> Option<&StaticFeatureMapping> {
+        self.config.static_features.iter().find(|mapping| {
+            code.coding.iter().any(|coding| {
+                coding.system == mapping.system
+                    && coding.code.as_deref() == Some(mapping.code.as_str())
+            })
+        })
+    }
+
+    fn find_dynamic_mapping(
+        &self,
+        code: &CodeableConcept,
+    ) -> Option<&super::mapping::DynamicFeatureMapping> {
+        self.config.dynamic_features.iter().find(|mapping| {
+            code.coding.iter().any(|coding| {
+                coding.system == mapping.system
+                    && coding.code.as_deref() == Some(mapping.code.as_str())
+            })
+        })
+    }
+
+    fn extract_text_content(&self, documents: &[DocumentReference]) -> Option<String> {
+        let mut text = Vec::new();
+
+        for document in documents {
+            for content in &document.content {
+                if let Some(data) = &content.attachment.data {
+                    text.push(data.clone());
                 }
             }
         }
 
-        // Convert to Vec<Vec<f32>>, sorted by time
-        let mut result: Vec<Vec<f32>> = time_points.into_values().collect();
-
-        // Truncate or pad to max sequence length
-        result.truncate(self.config.temporal_features.max_sequence_length);
-
-        Ok(result)
+        if text.is_empty() {
+            None
+        } else {
+            Some(text.join("\n"))
+        }
     }
 
-    fn extract_observation_value(&self, obs: &ObservationResource) -> Option<f32> {
-        // Handle different value types
-        if let Some(qty) = &obs.value_quantity {
-            return qty.value.map(|v| v as f32);
-        }
+    fn extract_image_references(&self, imaging: &[ImagingStudy]) -> Vec<String> {
+        imaging
+            .iter()
+            .flat_map(|study| study.endpoint.clone().unwrap_or_default())
+            .filter_map(|reference| reference.reference)
+            .collect()
+    }
+}
 
-        // Handle component observations (e.g., blood pressure)
-        if let Some(components) = &obs.component {
-            // For BP, might need special handling
-            // Return systolic as primary value, handle diastolic separately
-        }
-
-        None
+fn extract_observation_value(observation: &Observation) -> Option<f32> {
+    if let Some(quantity) = &observation.value_quantity {
+        return quantity.value.map(|value| value as f32);
     }
 
-    fn find_tabular_mapping(&self, code: &CodeableConcept) -> Option<&TabularFeatureMapping> {
-        // Search by LOINC first, then SNOMED
-        for coding in code.coding.as_ref()?.iter() {
-            if coding.system.as_deref() == Some("http://loinc.org") {
-                return self
-                    .config
-                    .tabular_features
-                    .iter()
-                    .find(|m| Some(m.loinc_code.as_str()) == coding.code.as_deref());
-            }
-        }
-        None
+    observation
+        .value_string
+        .as_ref()
+        .and_then(|value| value.parse::<f32>().ok())
+}
+
+fn observation_timestamp(observation: &Observation) -> Option<String> {
+    observation.effective_date_time.clone().or_else(|| {
+        observation
+            .effective_period
+            .as_ref()
+            .and_then(|period| period.start.clone())
+    })
+}
+
+fn condition_code(condition: &Condition) -> Option<(Option<String>, String)> {
+    let coding = condition
+        .code
+        .as_ref()?
+        .coding
+        .iter()
+        .find(|coding| coding.code.is_some())?;
+    Some((coding.system.clone(), coding.code.clone()?))
+}
+
+fn apply_conversion(value: f32, observation: &Observation, mapping: &StaticFeatureMapping) -> f32 {
+    apply_conversion_value(value, observation, mapping.unit_conversion.as_ref())
+}
+
+fn apply_conversion_dynamic(
+    value: f32,
+    observation: &Observation,
+    mapping: &super::mapping::DynamicFeatureMapping,
+) -> f32 {
+    apply_conversion_value(value, observation, mapping.unit_conversion.as_ref())
+}
+
+fn apply_conversion_value(
+    value: f32,
+    observation: &Observation,
+    conversion: Option<&super::mapping::UnitConversion>,
+) -> f32 {
+    let Some(conversion) = conversion else {
+        return value;
+    };
+
+    let source_unit = observation
+        .value_quantity
+        .as_ref()
+        .and_then(|quantity| quantity.code.as_deref())
+        .or_else(|| {
+            observation
+                .value_quantity
+                .as_ref()
+                .and_then(|quantity| quantity.unit.as_deref())
+        });
+
+    if source_unit == Some(conversion.from_unit.as_str()) {
+        value * conversion.multiplier
+    } else {
+        value
     }
+}
+
+fn calculate_age(birth_date: NaiveDate) -> i32 {
+    let today = Utc::now().date_naive();
+
+    let mut age = today.year() - birth_date.year();
+
+    if (today.month(), today.day()) < (birth_date.month(), birth_date.day()) {
+        age -= 1;
+    }
+
+    age.max(0)
 }

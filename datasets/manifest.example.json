@@ -1,0 +1,223 @@
+{
+	"version": 1,
+	"groups": [
+		{
+			"name": "all-supported-files",
+			"path": "data",
+			"files": [
+				{
+					"path": "patients.csv",
+					"format": "csv",
+					"kind": "patient",
+					"patient_id": "patient-001"
+				},
+				{
+					"path": "observations.parquet",
+					"format": "parquet",
+					"kind": "observation"
+				},
+				{
+					"path": "notes.json",
+					"format": "json",
+					"kind": "clinical_note",
+					"patient_id": "patient-001"
+				},
+				{
+					"path": "events.ndjson",
+					"format": "ndjson",
+					"kind": "observation"
+				},
+				{
+					"path": "patient.json",
+					"format": "fhir-json",
+					"kind": "fhir-resource",
+					"patient_id": "patient-001"
+				},
+				{
+					"path": "bundle.json",
+					"format": "fhir-json",
+					"kind": "fhir-bundle"
+				},
+				{
+					"path": "resources.ndjson",
+					"format": "fhir-ndjson",
+					"kind": "fhir-resource"
+				},
+				{
+					"path": "images.csv",
+					"format": "csv",
+					"kind": "image_metadata"
+				},
+				{
+					"path": "labels.csv",
+					"format": "csv",
+					"kind": "label"
+				},
+				{
+					"path": "image.png",
+					"format": "image",
+					"kind": "image",
+					"patient_id": "patient-001"
+				},
+				{
+					"path": "unknown.dat",
+					"format": "unknown",
+					"kind": "unknown"
+				}
+			],
+			"image_roots": [
+				{
+					"path": "images/by-patient",
+					"patient_id_pattern": "patient-(.+)",
+					"patient_id_depth": 1
+				},
+				{
+					"path": "images/by-encounter",
+					"patient_id_depth": 2
+				},
+				{
+					"path": "images",
+					"patient_id_pattern": ".*"
+				},
+				{
+					"path": "."
+				}
+			]
+		},
+		{
+			"name": "automatic-discovery",
+			"path": "discovered-data"
+		},
+		{
+			"name": "directory-source-with-defaults",
+			"path": "additional-data",
+			"files": [
+				{
+					"path": "tables"
+				},
+				{
+					"path": "images"
+				}
+			]
+		},
+		{
+			"name": "absolute-path-example",
+			"path": "/absolute/path/to/dataset",
+			"files": [
+				{
+					"path": "/absolute/path/to/dataset/example.csv",
+					"format": "csv",
+					"kind": "observation"
+				}
+			]
+		},
+		{
+			"name": "bigquery-mimic-maternal-admissions",
+			"path": "mimic-iv-3.1",
+			"files": [
+				{
+					"path": "maternal_admissions.csv",
+					"format": "csv",
+					"kind": "patient",
+					"mapping": {
+						"patient_id_column": "patient_id",
+						"disable_timestamp_detection": true,
+						"note_column": "discharge_summary",
+						"outcome_column": "mortality_label",
+						"ignored_columns": [
+							"subject_id",
+							"hadm_id",
+							"admittime",
+							"dischtime"
+						],
+						"feature_aliases": {
+							"avg_heart_rate": "heart_rate_avg",
+							"max_heart_rate": "heart_rate_max",
+							"avg_sys_bp": "systolic_bp_avg",
+							"max_sys_bp": "systolic_bp_max",
+							"avg_dia_bp": "diastolic_bp_avg",
+							"max_dia_bp": "diastolic_bp_max",
+							"min_spo2": "spo2_min"
+						}
+					}
+				}
+			]
+		},
+		{
+			"name": "ehrshot-long-form-events",
+			"path": "ehrshot",
+			"files": [
+				{
+					"path": "events.csv",
+					"format": "csv",
+					"kind": "observation",
+					"mapping": {
+						"patient_id_column": "patient_id",
+						"timestamp_column": "start",
+						"event_feature_column": "code",
+						"event_value_column": "value",
+						"event_table_column": "omop_table",
+						"event_visit_column": "visit_id",
+						"event_presence_value": 1.0
+					}
+				},
+				{
+					"path": "labels.csv",
+					"format": "csv",
+					"kind": "label"
+				}
+			]
+		},
+		{
+			"name": "all-input-kinds",
+			"path": "typed-data",
+			"files": [
+				{
+					"path": "patient.csv",
+					"format": "csv",
+					"kind": "patient"
+				},
+				{
+					"path": "observation.csv",
+					"format": "csv",
+					"kind": "observation"
+				},
+				{
+					"path": "clinical-note.csv",
+					"format": "csv",
+					"kind": "clinical_note"
+				},
+				{
+					"path": "image.png",
+					"format": "image",
+					"kind": "image"
+				},
+				{
+					"path": "image-metadata.csv",
+					"format": "csv",
+					"kind": "image_metadata"
+				},
+				{
+					"path": "label.csv",
+					"format": "csv",
+					"kind": "label"
+				},
+				{
+					"path": "resource.json",
+					"format": "json",
+					"kind": "fhir_resource"
+				},
+				{
+					"path": "bundle.json",
+					"format": "json",
+					"kind": "fhir_bundle"
+				},
+				{
+					"path": "unclassified.dat",
+					"format": "unknown",
+					"kind": "unknown"
+				}
+			]
+		}
+	]
+}

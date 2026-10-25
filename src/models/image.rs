@@ -1,5 +1,5 @@
 use crate::core::{Activation, Layer, Module};
-use ndarray::{s, Array, Array1, Array3, Array4, Axis};
+use ndarray::{Array, Array1, Array3, Array4, Axis, s};
 use rand::Rng;
 
 /// 2D convolution layer.
@@ -53,7 +53,7 @@ impl Conv2DLayer {
         stride: usize,
         padding: usize,
     ) -> Self {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
 
         // He initialization for ReLU activation
         let std_dev = (2.0 / (in_channels * kernel_size * kernel_size) as f32).sqrt();

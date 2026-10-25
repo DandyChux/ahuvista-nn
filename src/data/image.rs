@@ -4,7 +4,7 @@
 //! image data such as medical scans, photographs, or visualizations.
 
 use crate::data::DataLoader;
-use crate::utils::error::AppResult;
+use crate::error::AppResult;
 use image::{DynamicImage, GenericImageView, ImageBuffer, ImageReader, Rgb};
 use ndarray::{Array3, Axis};
 use std::fs::File;
@@ -15,6 +15,9 @@ use std::path::Path;
 pub struct ImageData {
     /// Processed images as 3D arrays (channels × height × width)
     pub images: Vec<Array3<f32>>,
+
+    /// Patient identifier for every image, aligned with `images`.
+    pub patient_ids: Vec<String>,
 
     /// Image size after preprocessing
     pub image_size: (usize, usize),
@@ -37,6 +40,7 @@ impl ImageData {
     pub fn new() -> Self {
         ImageData {
             images: Vec::new(),
+            patient_ids: Vec::new(),
             image_size: (0, 0),
             channels: 0,
             channel_means: Vec::new(),
@@ -167,6 +171,7 @@ impl ImageData {
 
         Ok(ImageData {
             images: normalized_images,
+            patient_ids: vec![String::new(); paths.len()],
             image_size: target_size,
             channels,
             channel_means,

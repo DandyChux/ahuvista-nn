@@ -23,13 +23,13 @@ A lightweight, Rust-based neural network library optimized for multi-modal data 
 - [Data Loading & Automatic Preparation](#data-loading--automatic-preparation)
 - [Architecture Overview](#architecture-overview)
 - [Training Models](#training-models)
-  - [Configuration Files](#1-configuration-file-approach-recommended)
-  - [Command-Line Interface](#2-command-line-interface)
-  - [Programmatic API](#3-programmatic-api)
+    - [Configuration Files](#1-configuration-file-approach-recommended)
+    - [Command-Line Interface](#2-command-line-interface)
+    - [Programmatic API](#3-programmatic-api)
 - [Making Predictions](#making-predictions)
-  - [Single Predictions](#single-prediction)
-  - [Batch Predictions](#batch-predictions)
-  - [Calibrated Predictions](#calibrated-predictions)
+    - [Single Predictions](#single-prediction)
+    - [Batch Predictions](#batch-predictions)
+    - [Calibrated Predictions](#calibrated-predictions)
 - [Modality Selection Guide](#modality-selection-guide)
 - [Data Format Specifications](#data-format-specifications)
 - [Configuration Reference](#configuration-reference)
@@ -91,15 +91,99 @@ cargo run --release --bin ahuvista-predict -- --help
 
 ### 1. Prepare Your Data
 
-First, prepare your CSV data and store it in the database:
+Preparation accepts a flat directory or explicit files. Files are classified by an optional manifest, then by content, then by extension. CSV, JSON/NDJSON, Parquet, and image inputs may be mixed; ambiguous files are skipped instead of being guessed as tabular data.
 
 ```bash
-# Prepare all modalities from the datasets directory
-cargo run --release --bin ahuvista-prepare -- \
-  --data-dir datasets \
+cargo run --release --bin ahuvista -- prepare \
+  --data-dir ./patient-data \
   --database ahuvista.db \
   --verbose
 ```
+
+For ambiguous exports, add an optional `manifest.json`:
+
+```json
+{
+  "version": 1,
+  "groups": [
+    {
+      "name": "clinical-export",
+      "path": ".",
+      "files": [
+        { "path": "patients.csv", "format": "csv", "kind": "patient" },
+        { "path": "observations.csv", "format": "csv", "kind": "observation" },
+        { "path": "notes.jsonl", "format": "ndjson", "kind": "clinical_note" },
+        {
+          "path": "ultrasound-001.png",
+          "format": "image",
+          "kind": "image",
+          "patient_id": "Patient/123"
+        }
+      ]
+    }
+  ]
+		}
+	]
+}
+```
+
+```bash
+cargo run --release --bin ahuvista -- prepare \
+  --data-dir ./patient-data \
+  --manifest ./patient-data/manifest.json \
+  --database ahuvista.db
+```
+
+No modality-specific folder structure is required. Existing modality folders remain compatible because recursive discovery is still supported.
+
+A local FHIR Bundle can be prepared without rearranging files:
+
+```bash
+cargo run --release --bin ahuvista -- prepare \
+  --fhir-bundle patient-bundle.json \
+  --database ahuvista.db
+```
+
+A FHIR server source is snapshotted locally before training. Patient mode uses `--patient`; cohort mode omits it and supplies FHIR search parameters:
+
+```bash
+FHIR_TOKEN='...' cargo run --release --bin ahuvista -- prepare \
+  --fhir-url https://fhir.example.org/fhir \
+  --fhir-token-env FHIR_TOKEN \
+  --patient 123 \
+  --fhir-profile https://example.org/fhir/StructureDefinition/clinical-bundle \
+  --database ahuvista.db
+
+FHIR_TOKEN='...' cargo run --release --bin ahuvista -- prepare \
+  --fhir-url https://fhir.example.org/fhir \
+  --fhir-token-env FHIR_TOKEN \
+  --fhir-query gender=female \
+  --fhir-query _lastUpdated=ge2025-01-01 \
+  --database ahuvista.db
+```
+
+For SMART-style client-credentials authentication, provide a JSON file:
+
+```json
+{
+	"token_url": "https://fhir.example.org/oauth/token",
+	"client_id": "ahuvista-training",
+	"client_secret": "provided-out-of-band",
+	"scope": "system/*.read"
+}
+```
+
+```bash
+cargo run --release --bin ahuvista -- prepare \
+  --fhir-url https://fhir.example.org/fhir \
+  --smart-credentials smart-client.json \
+  --patient 123 \
+  --database ahuvista.db
+```
+
+FHIR reads follow pagination links, retry transient failures, send an optional profile via `Accept-Profile`, and record source provenance in SQLite. Credentials are never stored in the database.
+
+Training always consumes the prepared local snapshot, which keeps runs reproducible and avoids querying the clinical system during model fitting.
 
 ### 2. Train a Simple Model (Tabular Data Only)
 
@@ -130,23 +214,44 @@ First, create an input file `patient_data.json`:
 
 ```json
 {
-  "patient_id": "PAT-001",
-  "tabular": [0.5, 0.3, 0.8, 0.1, 0.9, 0.4, 0.7, 0.2, 0.6, 0.5],
-  "temporal": [
-    [120.0, 80.0, 98.6, 72.0, 16.0],
-    [125.0, 82.0, 98.8, 75.0, 18.0]
-  ]
+	"patient_id": "PAT-001",
+	"tabular": [0.5, 0.3, 0.8, 0.1, 0.9, 0.4, 0.7, 0.2, 0.6, 0.5],
+	"temporal": [
+		[120.0, 80.0, 98.6, 72.0, 16.0],
+		[125.0, 82.0, 98.8, 75.0, 18.0]
+	]
 }
 ```
 
-Then run prediction:
+Then run prediction as application JSON:
 
 ```bash
-cargo run --release --bin ahuvista-predict -- \
+cargo run --release --bin ahuvista -- predict \
   --model models/maternal_mortality_model_modular.bin \
-  --modalities tabular,temporal \
   --input patient_data.json \
   --output result.json
+```
+
+FHIR output is available as a `RiskAssessment` or collection `Bundle`:
+
+```bash
+cargo run --release --bin ahuvista -- predict \
+  --model models/maternal_mortality_model_modular.bin \
+  --input patient_data.json \
+  --output-format fhir-risk-assessment \
+  --output risk-assessment.json
+```
+
+Publishing is deliberately opt-in and requires `--publish`:
+
+```bash
+FHIR_TOKEN='...' cargo run --release --bin ahuvista -- predict \
+  --model models/maternal_mortality_model_modular.bin \
+  --input patient_data.json \
+  --output-format fhir-risk-assessment \
+  --fhir-url https://fhir.example.org/fhir \
+  --fhir-token-env FHIR_TOKEN \
+  --publish
 ```
 
 ## 📊 Data Pipeline: Prepare → Train → Predict
@@ -155,14 +260,14 @@ AHuVista-NN uses a **three-stage pipeline** for data handling:
 
 ### Pipeline Overview
 
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│  ahuvista-      │     │  ahuvista-      │     │  ahuvista-      │
-│  prepare        │ ──▶ │  train          │ ──▶ │  predict        │
-│                 │     │                 │     │                 │
-│  CSV files      │     │  SQLite DB      │     │  Trained model  │
-│  ──────────▶    │     │  ──────────▶    │     │  ──────────▶    │
-│  SQLite DB      │     │  Model file     │     │  Predictions    │
-└─────────────────┘     └─────────────────┘     └─────────────────┘
+┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐
+│ ahuvista- │ │ ahuvista- │ │ ahuvista- │
+│ prepare │ ──▶ │ train │ ──▶ │ predict │
+│ │ │ │ │ │
+│ CSV files │ │ SQLite DB │ │ Trained model │
+│ ──────────▶ │ │ ──────────▶ │ │ ──────────▶ │
+│ SQLite DB │ │ Model file │ │ Predictions │
+└─────────────────┘ └─────────────────┘ └─────────────────┘
 
 ### Stage 1: Data Preparation (`ahuvista-prepare`)
 
@@ -176,18 +281,20 @@ cargo run --release --bin ahuvista-prepare -- \
 ```
 
 Options:**
-| Option | Description | Default |
-|--------|-------------|---------|
-| `--data-dir` | Path to datasets directory | `datasets` |
-| `--database` | Output SQLite database path | `ahuvista.db` |
-| `--patient-id-column` | Name of patient ID column | `PatientID` |
-| `--modalities` | Which modalities to prepare | all |
-| `--clear` | Clear existing data before import | false |
-| `--verbose` | Enable verbose logging | false |
+
+| Option                | Description                       | Default       |
+| --------------------- | --------------------------------- | ------------- |
+| `--data-dir`          | Path to datasets directory        | `datasets`    |
+| `--database`          | Output SQLite database path       | `ahuvista.db` |
+| `--patient-id-column` | Name of patient ID column         | `PatientID`   |
+| `--modalities`        | Which modalities to prepare       | all           |
+| `--clear`             | Clear existing data before import | false         |
+| `--verbose`           | Enable verbose logging            | false         |
 
 ### Stage 2: Training (`ahuvista-train`)
 
 Loads prepared data from database and trains the model:
+
 ```bash
 cargo run --release --bin ahuvista-train -- \
   --database ahuvista.db \
@@ -219,7 +326,8 @@ datasets/
 - **Scalability**: SQLite handles large datasets efficiently
 - **Reproducibility**: Database captures exact data state for each experiment
 - **Separation of concerns**: Data preparation is decoupled from training
-```
+
+````
 
 ### Supported Column Formats
 
@@ -242,9 +350,10 @@ The system automatically recognizes various column naming conventions:
 PatientID,Age,BloodPressure,Glucose,BMI,Pregnancies
 P001,28,120,95,22.5,2
 P002,35,145,110,28.0,4
-```
+````
 
 **temporal/measurements.csv:**
+
 ```csv
 PatientID,Timestamp,HeartRate,Temperature
 P001,2024-01-01T08:00,72,98.6
@@ -252,6 +361,7 @@ P001,2024-01-01T12:00,75,98.7
 ```
 
 **text/clinical_notes.csv:**
+
 ```csv
 PatientID,Notes
 P001,"Mild hypertension noted. Previous pregnancy uncomplicated."
@@ -264,11 +374,11 @@ If outcome files don't exist, the system generates them using:
 1. **Risk Scoring**: Analyzes patient characteristics (age, BP, glucose, BMI, etc.)
 2. **Mortality Assignment**: Higher risk scores → higher mortality probability
 3. **Cause Mapping**: Risk factors mapped to likely causes:
-   - High BP → Hypertensive disorders (code 1)
-   - Multiple pregnancies + age → Hemorrhage (code 0)
-   - High glucose → Infection/sepsis (code 2)
-   - High BMI + age → Abortion + Miscarriage (code 3)
-   - Other/None → code 4 (includes all survivors)
+    - High BP → Hypertensive disorders (code 1)
+    - Multiple pregnancies + age → Hemorrhage (code 0)
+    - High glucose → Infection/sepsis (code 2)
+    - High BMI + age → Abortion + Miscarriage (code 3)
+    - Other/None → code 4 (includes all survivors)
 
 ### Key Benefits
 
@@ -276,7 +386,7 @@ If outcome files don't exist, the system generates them using:
 ✅ **Handles inconsistent formats** - flexible column name matching  
 ✅ **Automatic merging** - combines multi-modal data by patient ID  
 ✅ **Smart outcome generation** - creates realistic training targets  
-✅ **Incremental updates** - add new files anytime, just re-run training  
+✅ **Incremental updates** - add new files anytime, just re-run training
 
 ## 🏗️ Architecture Overview
 
@@ -289,46 +399,46 @@ Ahuvista-NN uses a **late fusion architecture** where each modality is processed
 │                    Modular Late Fusion Network                      │
 ├─────────────────────────────────────────────────────────────────────┤
 │                                                                     │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌────────┐│
-│  │   Tabular    │  │   Temporal   │  │     Text     │  │ Image  ││
-│  │   Network    │  │   Network    │  │   Network    │  │Network ││
-│  │ (Feed-Fwd)   │  │    (RNN)     │  │   (RNN +     │  │ (CNN)  ││
-│  │              │  │              │  │  Embedding)  │  │        ││
-│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘  └───┬────┘│
-│         │                 │                 │              │      │
-│         │    Feature      │    Feature      │   Feature    │      │
-│         │    Vector       │    Vector       │   Vector     │      │
-│         │    (16-32d)     │    (16-32d)     │   (32-64d)   │      │
-│         │                 │                 │              │      │
-│         └─────────────────┴─────────────────┴──────────────┘      │
-│                                  │                                 │
-│                          ┌───────▼────────┐                        │
-│                          │  Concatenation │                        │
-│                          │  Fusion Layer  │                        │
-│                          └───────┬────────┘                        │
-│                                  │                                 │
-│                          ┌───────▼────────┐                        │
-│                          │   Classifier   │                        │
-│                          │    Network     │                        │
-│                          │   (64→32→1)    │                        │
-│                          └───────┬────────┘                        │
-│                                  │                                 │
-│                          ┌───────▼────────┐                        │
-│                          │   Prediction   │                        │
-│                          │  Risk Score    │                        │
-│                          │    (0.0-1.0)   │                        │
-│                          └────────────────┘                        │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌────────┐   │
+│  │   Tabular    │  │   Temporal   │  │     Text     │  │ Image  │   │
+│  │   Network    │  │   Network    │  │   Network    │  │Network │   │
+│  │ (Feed-Fwd)   │  │    (RNN)     │  │   (RNN +     │  │ (CNN)  │   │
+│  │              │  │              │  │  Embedding)  │  │        │   │
+│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘  └───┬────┘   │
+│         │                 │                 │              │        │
+│         │    Feature      │    Feature      │   Feature    │        │
+│         │    Vector       │    Vector       │   Vector     │        │
+│         │    (16-32d)     │    (16-32d)     │   (32-64d)   │        │
+│         │                 │                 │              │        │
+│         └─────────────────┴─────────────────┴──────────────┘        │
+│                                  │                                  │
+│                          ┌───────▼────────┐                         │
+│                          │  Concatenation │                         │
+│                          │  Fusion Layer  │                         │
+│                          └───────┬────────┘                         │
+│                                  │                                  │
+│                          ┌───────▼────────┐                         │
+│                          │   Classifier   │                         │
+│                          │    Network     │                         │
+│                          │   (64→32→1)    │                         │
+│                          └───────┬────────┘                         │
+│                                  │                                  │
+│                          ┌───────▼────────┐                         │
+│                          │   Prediction   │                         │
+│                          │  Risk Score    │                         │
+│                          │    (0.0-1.0)   │                         │
+│                          └────────────────┘                         │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Supported Modalities
 
-| Modality | Description | Network Type | Use Cases |
-|----------|-------------|--------------|-----------|
-| **Tabular** | Structured clinical data | Feed-forward MLP | Demographics, lab results, vital signs |
-| **Temporal** | Time-series sequences | Recurrent (RNN) | Continuous monitoring, longitudinal data |
-| **Text** | Unstructured text | RNN + Embeddings | Clinical notes, reports, documentation |
-| **Image** | Visual data | Convolutional (CNN) | Medical imaging, ultrasounds, photographs |
+| Modality     | Description              | Network Type        | Use Cases                                 |
+| ------------ | ------------------------ | ------------------- | ----------------------------------------- |
+| **Tabular**  | Structured clinical data | Feed-forward MLP    | Demographics, lab results, vital signs    |
+| **Temporal** | Time-series sequences    | Recurrent (RNN)     | Continuous monitoring, longitudinal data  |
+| **Text**     | Unstructured text        | RNN + Embeddings    | Clinical notes, reports, documentation    |
+| **Image**    | Visual data              | Convolutional (CNN) | Medical imaging, ultrasounds, photographs |
 
 ### Why Late Fusion?
 
@@ -351,38 +461,38 @@ Create `config.json`:
 
 ```json
 {
-  "modalities": {
-    "use_tabular": true,
-    "use_temporal": true,
-    "use_text": false,
-    "use_image": false
-  },
-  "data_paths": {
-    "data_dir": "datasets",
-    "patient_id_column": "PatientID",
-    "tabular_files": ["patient_demographics.csv", "lab_results.csv"],
-    "temporal_files": ["vitals_timeseries.csv"],
-    "text_files": null,
-    "image_files": null
-  },
-  "training": {
-    "epochs": 100,
-    "batch_size": 32,
-    "learning_rate": 0.001
-  },
-  "model": {
-    "tabular_hidden_sizes": [128, 64],
-    "tabular_output_size": 32,
-    "temporal_hidden_size": 64,
-    "temporal_output_size": 32,
-    "text_embedding_dim": 100,
-    "text_hidden_size": 64,
-    "text_max_vocab": 10000,
-    "image_channels": 3,
-    "image_height": 224,
-    "image_width": 224,
-    "classifier_hidden_sizes": [128, 64]
-  }
+	"modalities": {
+		"use_sequence": true,
+		"use_temporal": true,
+		"use_text": false,
+		"use_image": false
+	},
+	"data_paths": {
+		"data_dir": "datasets",
+		"patient_id_column": "PatientID",
+		"tabular_files": ["patient_demographics.csv", "lab_results.csv"],
+		"temporal_files": ["vitals_timeseries.csv"],
+		"text_files": null,
+		"image_files": null
+	},
+	"training": {
+		"epochs": 100,
+		"batch_size": 32,
+		"learning_rate": 0.001
+	},
+	"model": {
+		"tabular_hidden_sizes": [128, 64],
+		"tabular_output_size": 32,
+		"temporal_hidden_size": 64,
+		"temporal_output_size": 32,
+		"text_embedding_dim": 100,
+		"text_hidden_size": 64,
+		"text_max_vocab": 10000,
+		"image_channels": 3,
+		"image_height": 224,
+		"image_width": 224,
+		"classifier_hidden_sizes": [128, 64]
+	}
 }
 ```
 
@@ -421,20 +531,20 @@ cargo run --release --bin ahuvista-train -- \
 
 #### All CLI Options
 
-| Option | Short | Description | Example |
-|--------|-------|-------------|---------|
-| `--database` | | Path to prepared SQLite database | `--database ahuvista.db` |
-| `--config` | `-c` | Path to JSON config file | `--config config.json` |
-| `--modalities` | `-m` | Comma-separated modalities | `--modalities tabular,text` |
-| `--epochs` | `-e` | Number of training epochs | `--epochs 100` |
-| `--batch-size` | `-b` | Training batch size | `--batch-size 64` |
-| `--learning-rate` | `-l` | Learning rate | `--learning-rate 0.001` |
-| `--output-dir` | `-o` | Model output directory | `--output-dir ./models` |
-| `--no-privacy` | | Disable differential privacy | `--no-privacy` |
-| `--epsilon` | | Privacy epsilon value | `--epsilon 10.0` |
-| `--clip-norm` | | Gradient clipping norm | `--clip-norm 5.0` |
-| `--adaptive-lr` | | Enable adaptive learning rate | `--adaptive-lr` |
-| `--verbose` | `-v` | Enable verbose logging | `--verbose` |
+| Option            | Short | Description                      | Example                     |
+| ----------------- | ----- | -------------------------------- | --------------------------- |
+| `--database`      |       | Path to prepared SQLite database | `--database ahuvista.db`    |
+| `--config`        | `-c`  | Path to JSON config file         | `--config config.json`      |
+| `--modalities`    | `-m`  | Comma-separated modalities       | `--modalities tabular,text` |
+| `--epochs`        | `-e`  | Number of training epochs        | `--epochs 100`              |
+| `--batch-size`    | `-b`  | Training batch size              | `--batch-size 64`           |
+| `--learning-rate` | `-l`  | Learning rate                    | `--learning-rate 0.001`     |
+| `--output-dir`    | `-o`  | Model output directory           | `--output-dir ./models`     |
+| `--no-privacy`    |       | Disable differential privacy     | `--no-privacy`              |
+| `--epsilon`       |       | Privacy epsilon value            | `--epsilon 10.0`            |
+| `--clip-norm`     |       | Gradient clipping norm           | `--clip-norm 5.0`           |
+| `--adaptive-lr`   |       | Enable adaptive learning rate    | `--adaptive-lr`             |
+| `--verbose`       | `-v`  | Enable verbose logging           | `--verbose`                 |
 
 #### Examples
 
@@ -476,7 +586,7 @@ use std::collections::HashMap;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Configure modalities
     let modality_config = ModalityConfig {
-        use_tabular: true,
+        use_sequence: true,
         use_temporal: true,
         use_text: false,
         use_image: false,
@@ -526,7 +636,7 @@ fn create_model_from_available_data(
 ) -> Result<LateFusionNet, Box<dyn std::error::Error>> {
     // Build configuration from available data
     let config = ModalityConfig {
-        use_tabular: has_tabular,
+        use_sequence: has_tabular,
         use_temporal: has_temporal,
         use_text: has_text,
         use_image: has_image,
@@ -559,15 +669,15 @@ Create `patient_input.json`:
 
 ```json
 {
-  "patient_id": "PAT-12345",
-  "tabular": [0.5, 0.3, 0.8, 0.1, 0.9, 0.4, 0.7, 0.2, 0.6, 0.5],
-  "temporal": [
-    [120.0, 80.0, 98.6, 72.0, 16.0],
-    [125.0, 82.0, 98.8, 75.0, 18.0],
-    [130.0, 85.0, 99.0, 78.0, 20.0]
-  ],
-  "text": null,
-  "image_path": null
+	"patient_id": "PAT-12345",
+	"tabular": [0.5, 0.3, 0.8, 0.1, 0.9, 0.4, 0.7, 0.2, 0.6, 0.5],
+	"temporal": [
+		[120.0, 80.0, 98.6, 72.0, 16.0],
+		[125.0, 82.0, 98.8, 75.0, 18.0],
+		[130.0, 85.0, 99.0, 78.0, 20.0]
+	],
+	"text": null,
+	"image_path": null
 }
 ```
 
@@ -597,13 +707,13 @@ Output file `prediction_result.json`:
 
 ```json
 {
-  "risk_score": 0.73,
-  "calibrated_score": null,
-  "risk_category": "HIGH",
-  "confidence": 0.89,
-  "modalities_used": ["tabular", "temporal"],
-  "patient_id": "PAT-12345",
-  "timestamp": "2024-01-15T10:30:00Z"
+	"risk_score": 0.73,
+	"calibrated_score": null,
+	"risk_category": "HIGH",
+	"confidence": 0.89,
+	"modalities_used": ["tabular", "temporal"],
+	"patient_id": "PAT-12345",
+	"timestamp": "2024-01-15T10:30:00Z"
 }
 ```
 
@@ -678,12 +788,12 @@ The `--calibrate` parameter specifies the population prevalence (e.g., 0.001 = 0
 
 Each modality processes a different type of healthcare data:
 
-| Modality | Data Type | Examples | When to Use |
-|----------|-----------|----------|-------------|
-| **Tabular** | Structured | Demographics, lab results, vitals | Always include if available |
-| **Temporal** | Time-series | Continuous monitoring, trends | When tracking changes over time |
-| **Text** | Unstructured | Clinical notes, reports | Rich qualitative information available |
-| **Image** | Visual | Ultrasounds, X-rays, photos | Visual diagnosis required |
+| Modality     | Data Type    | Examples                          | When to Use                            |
+| ------------ | ------------ | --------------------------------- | -------------------------------------- |
+| **Tabular**  | Structured   | Demographics, lab results, vitals | Always include if available            |
+| **Temporal** | Time-series  | Continuous monitoring, trends     | When tracking changes over time        |
+| **Text**     | Unstructured | Clinical notes, reports           | Rich qualitative information available |
+| **Image**    | Visual       | Ultrasounds, X-rays, photos       | Visual diagnosis required              |
 
 ### Common Configuration Patterns
 
@@ -698,14 +808,15 @@ cargo run --release --bin ahuvista-train -- \
 ```
 
 **Configuration**:
+
 ```json
 {
-  "modalities": {
-    "use_tabular": true,
-    "use_temporal": true,
-    "use_text": false,
-    "use_image": false
-  }
+	"modalities": {
+		"use_sequence": true,
+		"use_temporal": true,
+		"use_text": false,
+		"use_image": false
+	}
 }
 ```
 
@@ -760,13 +871,13 @@ Do you have medical images?
 
 ### Performance Considerations
 
-| Configuration | Memory | Speed | Accuracy Potential |
-|--------------|---------|-------|-------------------|
-| Tabular only | ~50MB | Very Fast | Good |
-| Tabular + Temporal | ~75MB | Fast | Better |
-| Tabular + Text | ~100MB | Moderate | Better |
-| Tabular + Image | ~150MB | Moderate | Better |
-| All modalities | ~200MB | Slower | Best |
+| Configuration      | Memory | Speed     | Accuracy Potential |
+| ------------------ | ------ | --------- | ------------------ |
+| Tabular only       | ~50MB  | Very Fast | Good               |
+| Tabular + Temporal | ~75MB  | Fast      | Better             |
+| Tabular + Text     | ~100MB | Moderate  | Better             |
+| Tabular + Image    | ~150MB | Moderate  | Better             |
+| All modalities     | ~200MB | Slower    | Best               |
 
 ## 📊 Data Format Specifications
 
@@ -775,11 +886,13 @@ Do you have medical images?
 **Format**: CSV files with headers
 
 **Requirements**:
+
 - Must include `PatientID` column (or configured identifier)
 - Numeric features only
 - Missing values should be imputed before training
 
 **Example** (`patient_data.csv`):
+
 ```csv
 PatientID,Age,BMI,BloodPressure,HeartRate,Temperature,Hemoglobin,Glucose,RiskFactor1,RiskFactor2
 PAT-001,28,24.5,120,75,98.6,12.5,95,0.8,0.3
@@ -792,11 +905,13 @@ PAT-003,22,22.3,115,70,98.4,13.2,88,0.2,0.1
 **Format**: CSV with timestamp column
 
 **Requirements**:
+
 - Must include `PatientID` column
 - Must include `Timestamp` or time-ordered rows
 - Each patient can have multiple time points
 
 **Example** (`vitals_timeseries.csv`):
+
 ```csv
 PatientID,Timestamp,SystolicBP,DiastolicBP,Temperature,HeartRate,RespiratoryRate
 PAT-001,2024-01-01 08:00,120,80,98.6,72,16
@@ -810,11 +925,13 @@ PAT-002,2024-01-01 08:00,135,88,99.2,85,22
 **Format**: Plain text files or CSV with text column
 
 **Requirements**:
+
 - One document per patient
 - UTF-8 encoding
 - Vocabulary will be built automatically
 
 **Example** (`clinical_notes.txt`):
+
 ```
 PAT-001: Patient presents with mild hypertension. Blood pressure elevated but stable...
 PAT-002: Routine prenatal visit. Patient reports feeling well. No complications noted...
@@ -825,11 +942,13 @@ PAT-002: Routine prenatal visit. Patient reports feeling well. No complications 
 **Format**: Standard image formats (JPG, PNG, TIFF)
 
 **Requirements**:
+
 - Images will be resized to configured dimensions (default 224x224)
 - RGB or grayscale
 - One image per patient (or multiple images in directory structure)
 
 **Directory Structure**:
+
 ```
 images/
 ├── PAT-001.jpg
@@ -855,15 +974,15 @@ images/
 
 ```json
 {
-  "patient_id": "PAT-12345",
-  "tabular": [28.0, 24.5, 120.0, 75.0, 98.6, 12.5, 95.0, 0.8, 0.3, 0.1],
-  "temporal": [
-    [120.0, 80.0, 98.6, 72.0, 16.0],
-    [125.0, 82.0, 98.8, 75.0, 18.0],
-    [130.0, 85.0, 99.0, 78.0, 20.0]
-  ],
-  "text": "Patient presents with mild hypertension during routine prenatal visit.",
-  "image_path": "images/ultrasound_001.jpg"
+	"patient_id": "PAT-12345",
+	"tabular": [28.0, 24.5, 120.0, 75.0, 98.6, 12.5, 95.0, 0.8, 0.3, 0.1],
+	"temporal": [
+		[120.0, 80.0, 98.6, 72.0, 16.0],
+		[125.0, 82.0, 98.8, 75.0, 18.0],
+		[130.0, 85.0, 99.0, 78.0, 20.0]
+	],
+	"text": "Patient presents with mild hypertension during routine prenatal visit.",
+	"image_path": "images/ultrasound_001.jpg"
 }
 ```
 
@@ -873,47 +992,47 @@ images/
 
 ```json
 {
-  "modalities": {
-    "use_tabular": true,      // Enable/disable tabular data processing
-    "use_temporal": true,     // Enable/disable temporal/time-series processing
-    "use_text": false,        // Enable/disable text/NLP processing
-    "use_image": false        // Enable/disable image processing
-  },
-  "data_paths": {
-    "data_dir": "datasets",             // Root directory for all data files
-    "patient_id_column": "PatientID",   // Column name for patient identifiers
-    "tabular_files": ["file1.csv", "file2.csv"],    // List of tabular CSV files
-    "temporal_files": ["timeseries.csv"],            // List of temporal CSV files
-    "text_files": ["notes.txt", "reports.txt"],      // List of text files
-    "image_files": ["images/", "scans/"]             // Image directories or file lists
-  },
-  "training": {
-    "epochs": 50,              // Number of complete passes through training data
-    "batch_size": 32,          // Number of samples per training batch
-    "learning_rate": 0.001     // Learning rate for gradient descent
-  },
-  "model": {
-    // Tabular network architecture
-    "tabular_hidden_sizes": [64, 32],   // Hidden layer sizes (2 layers: 64→32 neurons)
-    "tabular_output_size": 16,           // Size of tabular feature vector
+	"modalities": {
+		"use_sequence": true, // Enable/disable tabular data processing
+		"use_temporal": true, // Enable/disable temporal/time-series processing
+		"use_text": false, // Enable/disable text/NLP processing
+		"use_image": false // Enable/disable image processing
+	},
+	"data_paths": {
+		"data_dir": "datasets", // Root directory for all data files
+		"patient_id_column": "PatientID", // Column name for patient identifiers
+		"tabular_files": ["file1.csv", "file2.csv"], // List of tabular CSV files
+		"temporal_files": ["timeseries.csv"], // List of temporal CSV files
+		"text_files": ["notes.txt", "reports.txt"], // List of text files
+		"image_files": ["images/", "scans/"] // Image directories or file lists
+	},
+	"training": {
+		"epochs": 50, // Number of complete passes through training data
+		"batch_size": 32, // Number of samples per training batch
+		"learning_rate": 0.001 // Learning rate for gradient descent
+	},
+	"model": {
+		// Tabular network architecture
+		"tabular_hidden_sizes": [64, 32], // Hidden layer sizes (2 layers: 64→32 neurons)
+		"tabular_output_size": 16, // Size of tabular feature vector
 
-    // Temporal network architecture
-    "temporal_hidden_size": 32,          // RNN hidden state size
-    "temporal_output_size": 16,          // Size of temporal feature vector
+		// Temporal network architecture
+		"temporal_hidden_size": 32, // RNN hidden state size
+		"temporal_output_size": 16, // Size of temporal feature vector
 
-    // Text network architecture
-    "text_embedding_dim": 50,            // Word embedding dimension
-    "text_hidden_size": 32,              // Text RNN hidden state size
-    "text_max_vocab": 5000,              // Maximum vocabulary size
+		// Text network architecture
+		"text_embedding_dim": 50, // Word embedding dimension
+		"text_hidden_size": 32, // Text RNN hidden state size
+		"text_max_vocab": 5000, // Maximum vocabulary size
 
-    // Image network architecture
-    "image_channels": 3,                 // Number of image channels (3=RGB, 1=grayscale)
-    "image_height": 224,                 // Target image height in pixels
-    "image_width": 224,                  // Target image width in pixels
+		// Image network architecture
+		"image_channels": 3, // Number of image channels (3=RGB, 1=grayscale)
+		"image_height": 224, // Target image height in pixels
+		"image_width": 224, // Target image width in pixels
 
-    // Classifier network
-    "classifier_hidden_sizes": [64, 32]  // Final classifier hidden layers
-  }
+		// Classifier network
+		"classifier_hidden_sizes": [64, 32] // Final classifier hidden layers
+	}
 }
 ```
 
@@ -921,24 +1040,25 @@ images/
 
 #### Modalities Section
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `use_tabular` | boolean | `true` | Process structured tabular data |
-| `use_temporal` | boolean | `true` | Process time-series sequences |
-| `use_text` | boolean | `false` | Process unstructured text |
-| `use_image` | boolean | `false` | Process image data |
+| Parameter      | Type    | Default | Description                     |
+| -------------- | ------- | ------- | ------------------------------- |
+| `use_sequence` | boolean | `true`  | Process structured tabular data |
+| `use_temporal` | boolean | `true`  | Process time-series sequences   |
+| `use_text`     | boolean | `false` | Process unstructured text       |
+| `use_image`    | boolean | `false` | Process image data              |
 
 **Note**: At least one modality must be enabled.
 
 #### Training Section
 
-| Parameter | Type | Range | Recommended | Description |
-|-----------|------|-------|-------------|-------------|
-| `epochs` | integer | 1-1000 | 50-100 | Full training passes |
-| `batch_size` | integer | 1-256 | 16-64 | Samples per batch |
-| `learning_rate` | float | 0.00001-0.1 | 0.001-0.01 | Gradient step size |
+| Parameter       | Type    | Range       | Recommended | Description          |
+| --------------- | ------- | ----------- | ----------- | -------------------- |
+| `epochs`        | integer | 1-1000      | 50-100      | Full training passes |
+| `batch_size`    | integer | 1-256       | 16-64       | Samples per batch    |
+| `learning_rate` | float   | 0.00001-0.1 | 0.001-0.01  | Gradient step size   |
 
 **Tuning Tips**:
+
 - **Small datasets** (< 1000 samples): Lower batch size (8-16), more epochs (100-200)
 - **Medium datasets** (1000-10000): Standard settings (batch=32, epochs=50-100)
 - **Large datasets** (> 10000): Larger batch size (64-128), fewer epochs (20-50)
@@ -946,23 +1066,28 @@ images/
 #### Model Architecture Section
 
 **Tabular Network**:
+
 - `tabular_hidden_sizes`: List of hidden layer sizes. Example: `[128, 64]` creates two layers
 - `tabular_output_size`: Feature vector dimension (typically 16-32)
 
 **Temporal Network**:
+
 - `temporal_hidden_size`: RNN memory size (typically 32-64)
 - `temporal_output_size`: Feature vector dimension (typically 16-32)
 
 **Text Network**:
+
 - `text_embedding_dim`: Word vector size (typically 50-300)
 - `text_hidden_size`: RNN memory size (typically 32-128)
 - `text_max_vocab`: Vocabulary limit (typically 5000-20000)
 
 **Image Network**:
+
 - `image_channels`: 3 for RGB, 1 for grayscale
 - `image_height`/`image_width`: Target dimensions (commonly 224x224 or 256x256)
 
 **Classifier**:
+
 - `classifier_hidden_sizes`: Final layers that combine modality features
 
 ## 🎯 Advanced Usage
@@ -1071,13 +1196,13 @@ let risk_level = if risk_score > 0.8 {
 
 ### Computational Requirements
 
-| Configuration | RAM Usage | Training Time* | Inference Time** |
-|--------------|-----------|----------------|------------------|
-| Tabular only | ~50 MB | 2-5 min | < 10 ms |
-| Tabular + Temporal | ~75 MB | 5-10 min | < 20 ms |
-| Tabular + Text | ~100 MB | 10-15 min | < 30 ms |
-| Tabular + Image | ~150 MB | 15-25 min | < 50 ms |
-| All modalities | ~200 MB | 30-45 min | < 100 ms |
+| Configuration      | RAM Usage | Training Time* | Inference Time** |
+| ------------------ | --------- | -------------- | ---------------- |
+| Tabular only       | ~50 MB    | 2-5 min        | < 10 ms          |
+| Tabular + Temporal | ~75 MB    | 5-10 min       | < 20 ms          |
+| Tabular + Text     | ~100 MB   | 10-15 min      | < 30 ms          |
+| Tabular + Image    | ~150 MB   | 15-25 min      | < 50 ms          |
+| All modalities     | ~200 MB   | 30-45 min      | < 100 ms         |
 
 \* Training time for 10,000 samples, 50 epochs on CPU (Intel i7)
 \** Single prediction on CPU
@@ -1085,18 +1210,21 @@ let risk_level = if risk_score > 0.8 {
 ### Optimization Tips
 
 **For Faster Training**:
+
 1. Use release mode: `cargo build --release`
 2. Increase batch size on machines with more RAM
 3. Disable unused modalities
 4. Use smaller network architectures for prototyping
 
 **For Lower Memory**:
+
 1. Reduce batch size
 2. Use smaller hidden layer sizes
 3. Limit vocabulary size for text
 4. Reduce image dimensions
 
 **For Faster Inference**:
+
 1. Compile with optimizations: `--release`
 2. Use minimal modalities needed
 3. Batch predictions when possible
@@ -1117,7 +1245,7 @@ let risk_level = if risk_score > 0.8 {
 cat > quick_config.json << 'EOF'
 {
   "modalities": {
-    "use_tabular": true,
+    "use_sequence": true,
     "use_temporal": false,
     "use_text": false,
     "use_image": false
@@ -1155,7 +1283,7 @@ cargo run --release --bin ahuvista-predict -- \
 cat > production_config.json << 'EOF'
 {
   "modalities": {
-    "use_tabular": true,
+    "use_sequence": true,
     "use_temporal": true,
     "use_text": true,
     "use_image": false
@@ -1247,6 +1375,7 @@ done
 **Cause**: No modalities selected in configuration
 
 **Solution**:
+
 ```bash
 # Ensure at least one modality is enabled
 cargo run --release --bin ahuvista-train -- \
@@ -1259,16 +1388,18 @@ cargo run --release --bin ahuvista-train -- \
 **Cause**: Model expects tabular data but input doesn't include it
 
 **Solution**: Ensure input JSON includes all required modalities:
+
 ```json
 {
-  "tabular": [/* your data */],
-  "temporal": null
+	"tabular": [/* your data */],
+	"temporal": null
 }
 ```
 
 #### Issue: Model training is too slow
 
 **Solutions**:
+
 1. Reduce batch size: `--batch-size 16`
 2. Use fewer epochs: `--epochs 20`
 3. Disable unnecessary modalities
@@ -1277,6 +1408,7 @@ cargo run --release --bin ahuvista-train -- \
 #### Issue: Out of memory during training
 
 **Solutions**:
+
 1. Reduce batch size: `--batch-size 8`
 2. Use smaller network architectures
 3. Process fewer modalities simultaneously
@@ -1285,6 +1417,7 @@ cargo run --release --bin ahuvista-train -- \
 #### Issue: Predictions seem uncalibrated
 
 **Solution**: Use Bayesian calibration:
+
 ```bash
 cargo run --release --bin ahuvista-predict -- \
   --model model.bin \
@@ -1296,6 +1429,7 @@ cargo run --release --bin ahuvista-predict -- \
 #### Issue: "Failed to load config file"
 
 **Causes & Solutions**:
+
 - Invalid JSON syntax → Validate JSON with `jsonlint`
 - File not found → Check path is correct
 - Wrong permissions → Ensure read permissions on file
@@ -1481,13 +1615,13 @@ Combine with commas: `--modalities tabular,temporal,text`
 ### Typical Workflow
 
 1. Prepare data (once, or when data changes)
-ahuvista-prepare --data-dir datasets --database ahuvista.db
+   ahuvista-prepare --data-dir datasets --database ahuvista.db
 
 2. Train model (can run multiple times with different configs)
-ahuvista-train --database ahuvista.db --epochs 100 --output-dir models
+   ahuvista-train --database ahuvista.db --epochs 100 --output-dir models
 
 3. Make predictions
-ahuvista-predict --model models/model.bin --input patient.json
+   ahuvista-predict --model models/model.bin --input patient.json
 
 ---
 

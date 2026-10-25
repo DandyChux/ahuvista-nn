@@ -1,4 +1,50 @@
-use std::fmt::{Display, Formatter};
+use std::fmt::{self, Display, Formatter};
+use std::io;
+
+#[derive(Debug)]
+pub enum FhirError {
+    Io(io::Error),
+    Json(serde_json::Error),
+    MissingPatient,
+    InvalidResource(String),
+    InvalidMapping(String),
+    UnsupportedResource(String),
+}
+
+impl fmt::Display for FhirError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(error) => write!(formatter, "FHIR I/O error: {error}"),
+            Self::Json(error) => write!(formatter, "FHIR JSON error: {error}"),
+            Self::MissingPatient => {
+                write!(formatter, "FHIR Bundle contains no Patient")
+            }
+            Self::InvalidResource(message) => {
+                write!(formatter, "Invalid FHIR resource: {message}")
+            }
+            Self::InvalidMapping(message) => {
+                write!(formatter, "Invalid FHIR mapping: {message}")
+            }
+            Self::UnsupportedResource(resource) => {
+                write!(formatter, "Unsupported FHIR resource: {resource}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for FhirError {}
+
+impl From<io::Error> for FhirError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl From<serde_json::Error> for FhirError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Json(error)
+    }
+}
 
 #[derive(Debug)]
 pub enum AppError {
@@ -11,9 +57,10 @@ pub enum AppError {
     /// Domain Error is related to business logic or data validation
     DomainError(String),
     ImageError(image::ImageError),
-    SqliteError(rusqlite::Error),
-    #[cfg(feature = "fhir")]
+    DatabaseError(rusqlite::Error),
+    MigrationError(refinery::Error),
     FhirError(crate::data::FhirError),
+    InvalidData(String),
 }
 
 impl Display for AppError {
@@ -25,10 +72,11 @@ impl Display for AppError {
             AppError::ModelError(msg) => write!(f, "Model training or prediction error: {}", msg),
             AppError::CsvError(msg) => write!(f, "CSV processing error: {}", msg),
             AppError::JsonError(msg) => write!(f, "JSON processing error: {}", msg),
+            AppError::InvalidData(msg) => write!(f, "Invalid data: {}", msg),
             AppError::DomainError(msg) => write!(f, "Domain error: {}", msg),
             AppError::ImageError(msg) => write!(f, "Image processing error: {}", msg),
-            AppError::SqliteError(msg) => write!(f, "SQLite error: {}", msg),
-            #[cfg(feature = "fhir")]
+            AppError::DatabaseError(msg) => write!(f, "SQLite error: {}", msg),
+            AppError::MigrationError(msg) => write!(f, "Migration error: {}", msg),
             AppError::FhirError(err) => write!(f, "FHIR error: {}", err),
         }
     }
@@ -74,9 +122,8 @@ impl_from_error!(serde_json::Error, JsonError);
 impl_from_error!(String, DomainError);
 impl_from_error!(image::ImageError, ImageError);
 impl_from_error!(std::string::FromUtf8Error => DomainError as String);
-impl_from_error!(rusqlite::Error, SqliteError);
-#[cfg(feature = "fhir")]
-impl_from_error!(crate::data::FhirError, FhirError);
+impl_from_error!(rusqlite::Error, DatabaseError);
+impl_from_error!(refinery::Error, MigrationError);
 impl_from_error!(&str => DomainError as String);
 
 pub type AppResult<T, E = AppError> = Result<T, E>;

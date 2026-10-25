@@ -15,11 +15,16 @@ pub mod models;
 // Training, loss functions, and optimization
 pub mod training;
 
-// Utility functions
-pub mod utils;
-
 // Config
 pub mod config;
 
 // Audit
 pub mod audit;
+
+pub mod error;
+
+pub mod application;
+
+pub mod prediction;
+
+pub mod model_artifact;

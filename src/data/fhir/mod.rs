@@ -1,13 +1,15 @@
-pub mod coding;
+pub mod client;
 pub mod error;
 pub mod mapping;
-pub mod output;
 pub mod parser;
+pub mod provenance;
 pub mod resources;
+pub mod risk_assessment;
 
-pub use coding::*;
+pub use client::*;
 pub use error::*;
 pub use mapping::*;
-pub use output::*;
 pub use parser::*;
+pub use provenance::*;
 pub use resources::*;
+pub use risk_assessment::*;

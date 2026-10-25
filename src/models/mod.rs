@@ -1,9 +1,11 @@
+pub mod gru;
 pub mod image;
-pub mod tabular;
-pub mod temporal;
+pub mod rnn;
+pub mod sequence;
 pub mod text;
 
+pub use gru::*;
 pub use image::*;
-pub use tabular::*;
-pub use temporal::*;
+pub use rnn::*;
+pub use sequence::*;
 pub use text::*;
